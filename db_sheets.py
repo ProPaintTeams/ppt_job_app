@@ -1,376 +1,505 @@
-"""
-Google Sheets database module for Pro Paint Teams.
-Handles all read/write operations to a single Google Spreadsheet
-with 5 worksheets: Clients, Jobs, Quote_Areas, Attendance, Bonus_Log.
+"""Google Sheets backend for PPT Job App (cloud + multi-user)."""
 
-Setup: the user creates a Google Sheet in their own Drive, shares it
-with the service account email, and saves the spreadsheet ID to
-sheet_config.json.  This avoids using the service account's own
-(tiny) Drive storage quota.
-"""
+from __future__ import annotations
 
-import os
 import json
-from datetime import date
+import os
+import time
+from datetime import datetime
+from typing import Callable, TypeVar
 
 import gspread
 import pandas as pd
+from google.auth.exceptions import RefreshError
+from google.auth.transport.requests import Request
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import APIError
+
+T = TypeVar("T")
+
+_sp_cache = None
+_worksheets_verified = False
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-SHEET_CLIENTS = "Clients"
-SHEET_JOBS = "Jobs"
-SHEET_QUOTE_AREAS = "Quote_Areas"
-SHEET_ATTENDANCE = "Attendance"
-SHEET_BONUS_LOG = "Bonus_Log"
+SHEET_HEADERS = {
+    "Clients": ["client", "phone", "email", "address", "date_added"],
+    "Jobs": [
+        "job_no",
+        "job_name",
+        "client",
+        "area_manager",
+        "team_leader",
+        "start_date",
+        "total_labour",
+        "man_days_available",
+        "status",
+        "date_created",
+    ],
+    "Quote_Areas": [
+        "id",
+        "job_no",
+        "quote_area",
+        "unit",
+        "quantity",
+        "description",
+        "prod_qty_per_md",
+    ],
+    "Attendance": ["id", "job_no", "painter_name", "emp_id", "hourly_rate"]
+    + [f"day{i}" for i in range(1, 15)],
+    "Bonus_Log": [
+        "job_no",
+        "man_days_available",
+        "actual_man_days",
+        "days_saved",
+        "bonus_rate",
+        "total_bonus_pool",
+        "bonus_per_painter",
+    ],
+    "Custom_Rates": [
+        "sort_order",
+        "item",
+        "unit",
+        "material",
+        "labour",
+        "default_job_notes",
+        "date_updated",
+    ],
+    "Additional_Rates": ["sort_order", "item", "rate_unit", "rate_value", "date_updated"],
+}
 
-CLIENTS_HEADERS = ["Client Name", "Phone", "Email", "Address", "Notes", "Date Added"]
-JOBS_HEADERS = [
-    "Job No", "Job Name", "Client", "Area Manager", "Team Leader",
-    "Start Date", "Status", "Total Labour Quoted", "Man Days Available", "Date Created",
-]
-QUOTE_AREAS_HEADERS = [
-    "Job No", "Quote Area", "Unit", "Quantity", "Prod Rate", "Allowed Man-Days", "Description",
-]
-ATTENDANCE_HEADERS = [
-    "Job No", "Painter Name", "Emp/ID", "Hourly Rate",
-    "Day 1", "Day 2", "Day 3", "Day 4", "Day 5", "Day 6", "Day 7",
-    "Day 8", "Day 9", "Day 10", "Day 11", "Day 12", "Day 13", "Day 14",
-    "Total Hours", "Man-Days",
-]
-BONUS_LOG_HEADERS = [
-    "Job No", "Man Days Available", "Actual Man-Days Used", "Days Saved",
-    "Bonus Rate", "Total Bonus Pool", "Bonus Per Painter", "Date Completed",
-]
 
-_gc = None
-_spreadsheet = None
-
-_DIR = os.path.dirname(os.path.abspath(__file__))
+def _app_dir() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
 
 
-def _creds_path():
-    return os.path.join(_DIR, "credentials.json")
+def _creds_path() -> str:
+    return os.path.join(_app_dir(), "credentials.json")
 
 
-def _config_path():
-    return os.path.join(_DIR, "sheet_config.json")
+def _config_path() -> str:
+    return os.path.join(_app_dir(), "sheet_config.json")
 
 
-def _read_spreadsheet_id():
-    """Read the spreadsheet ID from sheet_config.json."""
-    path = _config_path()
-    if not os.path.isfile(path):
-        return None
+def _normalize_service_account_info(info: dict) -> dict:
+    normalized = dict(info)
+    private_key = normalized.get("private_key", "")
+    if isinstance(private_key, str) and "\\n" in private_key:
+        normalized["private_key"] = private_key.replace("\\n", "\n")
+    return normalized
+
+
+def _load_credentials() -> Credentials | None:
     try:
-        with open(path, "r") as f:
-            data = json.load(f)
-        return data.get("spreadsheet_id", "").strip() or None
+        import streamlit as st
+
+        for key in ("gcp_service_account", "gcp"):
+            if key in st.secrets:
+                return Credentials.from_service_account_info(
+                    _normalize_service_account_info(dict(st.secrets[key])),
+                    scopes=SCOPES,
+                )
     except Exception:
-        return None
+        pass
+
+    path = _creds_path()
+    if os.path.isfile(path):
+        return Credentials.from_service_account_file(path, scopes=SCOPES)
+    return None
 
 
-def save_spreadsheet_id(sheet_id):
-    """Persist the spreadsheet ID to sheet_config.json."""
-    with open(_config_path(), "w") as f:
-        json.dump({"spreadsheet_id": sheet_id}, f, indent=2)
-
-
-def get_service_account_email():
-    """Return the service account email from credentials.json."""
+def _verify_credentials(creds: Credentials) -> None:
+    """Refresh the token early so auth problems surface with a clear message."""
     try:
-        with open(_creds_path(), "r") as f:
-            return json.load(f).get("client_email", "")
-    except Exception:
-        return ""
-
-
-def _connect():
-    """Authenticate and open the spreadsheet by ID (from sheet_config.json)."""
-    global _gc, _spreadsheet
-    if _gc is not None and _spreadsheet is not None:
-        return _spreadsheet
-
-    creds = Credentials.from_service_account_file(_creds_path(), scopes=SCOPES)
-    _gc = gspread.authorize(creds)
-
-    sheet_id = _read_spreadsheet_id()
-    if not sheet_id:
+        creds.refresh(Request())
+    except RefreshError as exc:
+        email = getattr(creds, "service_account_email", "unknown")
         raise RuntimeError(
-            "No spreadsheet ID configured. Run setup_sheets.py first "
-            "(see README.md for instructions)."
-        )
-
-    _spreadsheet = _gc.open_by_key(sheet_id)
-    _ensure_worksheets(_spreadsheet)
-    return _spreadsheet
-
-
-def _ensure_worksheets(sp):
-    """Create any missing worksheets with headers."""
-    existing = {ws.title for ws in sp.worksheets()}
-    sheet_defs = [
-        (SHEET_CLIENTS, CLIENTS_HEADERS),
-        (SHEET_JOBS, JOBS_HEADERS),
-        (SHEET_QUOTE_AREAS, QUOTE_AREAS_HEADERS),
-        (SHEET_ATTENDANCE, ATTENDANCE_HEADERS),
-        (SHEET_BONUS_LOG, BONUS_LOG_HEADERS),
-    ]
-    for title, headers in sheet_defs:
-        if title not in existing:
-            ws = sp.add_worksheet(title=title, rows=1000, cols=len(headers))
-            ws.append_row(headers, value_input_option="RAW")
-
-    if "Sheet1" in existing:
-        try:
-            default = sp.worksheet("Sheet1")
-            if default.row_count <= 1:
-                vals = default.get_all_values()
-                if not vals or vals == [[]]:
-                    sp.del_worksheet(default)
-        except Exception:
-            pass
+            f"Google authentication failed for service account {email}. "
+            "Google reported that this account does not exist or its key was revoked. "
+            "In Google Cloud Console → IAM & Admin → Service Accounts, confirm the account "
+            "still exists, create a new JSON key if needed, then update credentials.json "
+            "and Streamlit secrets with the new file."
+        ) from exc
 
 
-def is_configured():
-    """Return True if credentials.json + sheet_config.json both exist and are valid."""
-    creds = _creds_path()
-    if not os.path.isfile(creds):
-        return False
+def _get_spreadsheet_id() -> str | None:
     try:
-        with open(creds, "r") as f:
-            data = json.load(f)
-        if "client_email" not in data:
-            return False
-    except Exception:
-        return False
+        import streamlit as st
 
-    return _read_spreadsheet_id() is not None
+        if "spreadsheet_id" in st.secrets:
+            return str(st.secrets["spreadsheet_id"]).strip() or None
+    except Exception:
+        pass
+
+    config_path = _config_path()
+    if os.path.isfile(config_path):
+        with open(config_path, encoding="utf-8") as f:
+            data = json.load(f)
+            return (data.get("spreadsheet_id") or "").strip() or None
+    return None
+
+
+def is_configured() -> bool:
+    return bool(_load_credentials() and _get_spreadsheet_id())
+
+
+def get_service_account_email() -> str:
+    creds = _load_credentials()
+    if creds is None:
+        raise RuntimeError("credentials.json not found and no Streamlit secrets configured")
+    return creds.service_account_email
+
+
+def save_spreadsheet_id(sheet_id: str) -> None:
+    with open(_config_path(), "w", encoding="utf-8") as f:
+        json.dump({"spreadsheet_id": sheet_id.strip()}, f, indent=2)
+
+
+def _reset_connection_cache() -> None:
+    global _sp_cache, _worksheets_verified
+    _sp_cache = None
+    _worksheets_verified = False
+
+
+def _retry_on_quota(func: Callable[..., T], *args, **kwargs) -> T:
+    """Retry Google Sheets calls when the per-minute read/write quota is hit."""
+    for attempt in range(5):
+        try:
+            return func(*args, **kwargs)
+        except APIError as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status == 429 and attempt < 4:
+                time.sleep(min(2**attempt * 3, 45))
+                continue
+            raise
 
 
 def connect():
-    """Public entry point. Returns the spreadsheet or raises on failure."""
-    return _connect()
+    global _sp_cache, _worksheets_verified
+
+    if _sp_cache is not None:
+        return _sp_cache
+
+    creds = _load_credentials()
+    if creds is None:
+        raise RuntimeError(
+            "Google credentials not found. Add credentials.json or Streamlit secrets."
+        )
+    _verify_credentials(creds)
+    sheet_id = _get_spreadsheet_id()
+    if not sheet_id:
+        raise RuntimeError(
+            "Spreadsheet ID not configured. Run setup_sheets.py or set spreadsheet_id in secrets."
+        )
+    gc = gspread.authorize(creds)
+    sp = _retry_on_quota(gc.open_by_key, sheet_id)
+    _retry_on_quota(_ensure_worksheets, sp)
+    _worksheets_verified = True
+    _sp_cache = sp
+    return sp
 
 
-# ---------------------------------------------------------------------------
-# Clients
-# ---------------------------------------------------------------------------
+def _ensure_worksheets(sp) -> None:
+    existing = {ws.title for ws in sp.worksheets()}
+    for name, headers in SHEET_HEADERS.items():
+        if name not in existing:
+            ws = sp.add_worksheet(title=name, rows=1000, cols=max(len(headers), 1))
+            _retry_on_quota(ws.update, [headers], "A1")
 
-def save_client(name, phone="", email="", address="", notes=""):
-    """Append client if not already present (matched by name). Returns True if new."""
-    sp = _connect()
-    ws = sp.worksheet(SHEET_CLIENTS)
-    existing = ws.col_values(1)
-    if name in existing:
+
+def _worksheet(name: str):
+    return connect().worksheet(name)
+
+
+def _read_dataframe(name: str) -> pd.DataFrame:
+    if not is_configured():
+        return pd.DataFrame(columns=SHEET_HEADERS[name])
+    ws = _worksheet(name)
+    records = _retry_on_quota(ws.get_all_records)
+    headers = SHEET_HEADERS[name]
+    if not records:
+        return pd.DataFrame(columns=headers)
+    return pd.DataFrame(records)
+
+
+def _upsert_by_key(name: str, key_field: str, key_value: str, row: dict) -> None:
+    ws = _worksheet(name)
+    headers = SHEET_HEADERS[name]
+    values = _retry_on_quota(ws.get_all_values)
+    if not values:
+        _retry_on_quota(ws.update, [headers], "A1")
+        values = [headers]
+
+    header_row = values[0]
+    try:
+        key_idx = header_row.index(key_field)
+    except ValueError:
+        key_idx = headers.index(key_field)
+
+    row_values = [str(row.get(h, "") or "") for h in headers]
+    key_value = str(key_value).strip()
+
+    for row_num, existing in enumerate(values[1:], start=2):
+        if len(existing) > key_idx and str(existing[key_idx]).strip() == key_value:
+            _retry_on_quota(ws.update, [row_values], f"A{row_num}")
+            return
+
+    _retry_on_quota(ws.append_row, row_values, value_input_option="USER_ENTERED")
+
+
+def _update_row_fields(name: str, key_field: str, key_value: str, fields: dict) -> bool:
+    """Find a row by key and update only the supplied fields in-place.
+
+    Returns True if the row was found and updated, False if not found.
+    Unlike _upsert_by_key this never appends a new row.
+    """
+    ws = _worksheet(name)
+    headers = SHEET_HEADERS[name]
+    values = _retry_on_quota(ws.get_all_values)
+    if not values:
         return False
-    ws.append_row(
-        [name, phone, email, address, notes, str(date.today())],
-        value_input_option="USER_ENTERED",
+
+    header_row = values[0]
+    try:
+        key_idx = header_row.index(key_field)
+    except ValueError:
+        try:
+            key_idx = headers.index(key_field)
+        except ValueError:
+            return False
+
+    key_value = str(key_value).strip()
+
+    for row_num, existing in enumerate(values[1:], start=2):
+        if len(existing) > key_idx and str(existing[key_idx]).strip() == key_value:
+            # Build updated row: start from existing values, overlay changed fields
+            existing_padded = list(existing) + [""] * max(0, len(headers) - len(existing))
+            updated = list(existing_padded[:len(headers)])
+            for field, value in fields.items():
+                if field in headers:
+                    updated[headers.index(field)] = str(value) if value is not None else ""
+            _retry_on_quota(ws.update, [updated], f"A{row_num}")
+            return True
+
+    return False
+
+
+def _replace_sheet(name: str, rows: list[dict]) -> None:
+    ws = _worksheet(name)
+    headers = SHEET_HEADERS[name]
+    data = [headers]
+    for row in rows:
+        data.append([row.get(h, "") for h in headers])
+    _retry_on_quota(ws.clear)
+    _retry_on_quota(ws.update, data, "A1")
+
+
+# ====================== CLIENTS ======================
+def save_client(client, phone="", email="", address=""):
+    if not is_configured():
+        raise RuntimeError("Google Sheets is not configured")
+    if not str(client or "").strip():
+        raise ValueError("Client name is required")
+    _upsert_by_key(
+        "Clients",
+        "client",
+        str(client).strip(),
+        {
+            "client": str(client).strip(),
+            "phone": phone or "",
+            "email": email or "",
+            "address": address or "",
+            "date_added": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        },
     )
-    return True
 
 
 def get_all_clients():
-    """Return all clients as a DataFrame."""
-    sp = _connect()
-    ws = sp.worksheet(SHEET_CLIENTS)
-    data = ws.get_all_records()
-    if not data:
-        return pd.DataFrame(columns=CLIENTS_HEADERS)
-    return pd.DataFrame(data)
+    return _read_dataframe("Clients")
 
 
-# ---------------------------------------------------------------------------
-# Jobs
-# ---------------------------------------------------------------------------
+# ====================== JOBS ======================
+def save_job(
+    job_no,
+    job_name,
+    client,
+    area_manager,
+    team_leader,
+    start_date,
+    total_labour,
+    man_days_available,
+):
+    if not is_configured():
+        raise RuntimeError("Google Sheets is not configured")
+    _upsert_by_key(
+        "Jobs",
+        "job_no",
+        str(job_no),
+        {
+            "job_no": str(job_no),
+            "job_name": job_name or "",
+            "client": client or "",
+            "area_manager": area_manager or "",
+            "team_leader": team_leader or "",
+            "start_date": str(start_date),
+            "total_labour": float(total_labour or 0),
+            "man_days_available": float(man_days_available or 0),
+            "status": "Open",
+            "date_created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        },
+    )
 
-def save_job(job_no, job_name, client, area_manager, team_leader,
-             start_date, total_labour, man_days_available, status="Open"):
-    """Insert or update a job by Job No."""
-    sp = _connect()
-    ws = sp.worksheet(SHEET_JOBS)
-    job_nos = ws.col_values(1)
-    row_data = [
-        job_no, job_name, client, area_manager, team_leader,
-        str(start_date), status, float(total_labour),
-        round(float(man_days_available), 2), str(date.today()),
-    ]
 
-    if job_no in job_nos:
-        row_idx = job_nos.index(job_no) + 1
-        ws.update(f"A{row_idx}:J{row_idx}", [row_data], value_input_option="USER_ENTERED")
-    else:
-        ws.append_row(row_data, value_input_option="USER_ENTERED")
+def update_job_fields(job_no: str, fields: dict) -> bool:
+    """Update specific fields of an existing job without touching the rest.
+
+    Fields that are NOT in `fields` (e.g. total_labour, date_created) are
+    left exactly as they are in the sheet.  Never creates a new row.
+    Returns True if the job was found and updated.
+    """
+    if not is_configured():
+        raise RuntimeError("Google Sheets is not configured")
+    return _update_row_fields("Jobs", "job_no", str(job_no), fields)
+
+
+def update_client_fields(original_name: str, fields: dict) -> bool:
+    """Update specific fields of an existing client record.
+
+    Looks up the client by `original_name` so renaming the client works
+    correctly (the old row is updated rather than a new one appended).
+    Never creates a new row.  Returns True if the client was found.
+    """
+    if not is_configured():
+        raise RuntimeError("Google Sheets is not configured")
+    return _update_row_fields("Clients", "client", original_name, fields)
 
 
 def get_all_jobs():
-    """Return all jobs as a DataFrame."""
-    sp = _connect()
-    ws = sp.worksheet(SHEET_JOBS)
-    data = ws.get_all_records()
-    if not data:
-        return pd.DataFrame(columns=JOBS_HEADERS)
-    return pd.DataFrame(data)
-
-
-def update_job_status(job_no, new_status):
-    """Set job status to 'Open' or 'Complete'."""
-    sp = _connect()
-    ws = sp.worksheet(SHEET_JOBS)
-    job_nos = ws.col_values(1)
-    if job_no in job_nos:
-        row_idx = job_nos.index(job_no) + 1
-        ws.update_cell(row_idx, 7, new_status)
-
-
-# ---------------------------------------------------------------------------
-# Quote Areas
-# ---------------------------------------------------------------------------
-
-def save_quote_areas(job_no, df):
-    """Replace all quote area rows for a job_no with the given DataFrame."""
-    sp = _connect()
-    ws = sp.worksheet(SHEET_QUOTE_AREAS)
-
-    all_vals = ws.get_all_values()
-    rows_to_keep = [all_vals[0]]
-    for row in all_vals[1:]:
-        if row and row[0] != job_no:
-            rows_to_keep.append(row)
-
-    for _, r in df.iterrows():
-        rows_to_keep.append([
-            job_no,
-            str(r.get("Quote Area", "")),
-            str(r.get("Unit", "")),
-            float(r.get("Quantity", 0)),
-            float(r.get("Prod Qty / Man-Day", 0)),
-            round(float(r.get("Allowed Man-Days", 0)), 2),
-            str(r.get("Description", "")),
-        ])
-
-    ws.clear()
-    ws.update(f"A1:G{len(rows_to_keep)}", rows_to_keep, value_input_option="USER_ENTERED")
+    df = _read_dataframe("Jobs")
+    if not df.empty and "job_no" in df.columns:
+        df = df.copy()
+        df["Job No"] = df["job_no"].astype(str)
+    elif df.empty:
+        df = pd.DataFrame(columns=SHEET_HEADERS["Jobs"] + ["Job No"])
+    return df
 
 
 def get_quote_areas(job_no=None):
-    """Return quote areas, optionally filtered by job_no."""
-    sp = _connect()
-    ws = sp.worksheet(SHEET_QUOTE_AREAS)
-    data = ws.get_all_records()
-    if not data:
-        return pd.DataFrame(columns=QUOTE_AREAS_HEADERS)
-    df = pd.DataFrame(data)
-    if job_no is not None:
-        df = df[df["Job No"] == job_no]
+    df = _read_dataframe("Quote_Areas")
+    if job_no and not df.empty and "job_no" in df.columns:
+        df = df[df["job_no"].astype(str) == str(job_no)]
     return df
-
-
-# ---------------------------------------------------------------------------
-# Attendance
-# ---------------------------------------------------------------------------
-
-def save_attendance(job_no, df):
-    """Replace all attendance rows for a job_no."""
-    sp = _connect()
-    ws = sp.worksheet(SHEET_ATTENDANCE)
-
-    all_vals = ws.get_all_values()
-    rows_to_keep = [all_vals[0]] if all_vals else [ATTENDANCE_HEADERS]
-    for row in all_vals[1:]:
-        if row and row[0] != job_no:
-            rows_to_keep.append(row)
-
-    day_cols = [f"Day {i}" for i in range(1, 15)]
-    for _, r in df.iterrows():
-        row_data = [
-            job_no,
-            str(r.get("Painter Name", "")),
-            str(r.get("Emp/ID", "")),
-            float(r.get("Hourly Rate", 0)),
-        ]
-        for d in day_cols:
-            row_data.append(float(r.get(d, 0)))
-        row_data.append(float(r.get("Total Hours", 0)))
-        row_data.append(round(float(r.get("Man-Days", 0)), 2))
-        rows_to_keep.append(row_data)
-
-    ws.clear()
-    if rows_to_keep:
-        ws.update(
-            f"A1:{gspread.utils.rowcol_to_a1(len(rows_to_keep), len(ATTENDANCE_HEADERS))}",
-            rows_to_keep,
-            value_input_option="USER_ENTERED",
-        )
 
 
 def get_attendance(job_no=None):
-    """Return attendance records, optionally filtered by job_no."""
-    sp = _connect()
-    ws = sp.worksheet(SHEET_ATTENDANCE)
-    data = ws.get_all_records()
-    if not data:
-        return pd.DataFrame(columns=ATTENDANCE_HEADERS)
-    df = pd.DataFrame(data)
-    if job_no is not None:
-        df = df[df["Job No"] == job_no]
+    df = _read_dataframe("Attendance")
+    if job_no and not df.empty and "job_no" in df.columns:
+        df = df[df["job_no"].astype(str) == str(job_no)]
     return df
 
 
-# ---------------------------------------------------------------------------
-# Bonus Log
-# ---------------------------------------------------------------------------
-
-def save_bonus(job_no, man_days_available, actual_used, days_saved,
-               bonus_rate, total_bonus_pool, bonus_per_painter):
-    """Insert or update a bonus log entry for a job."""
-    sp = _connect()
-    ws = sp.worksheet(SHEET_BONUS_LOG)
-    job_nos = ws.col_values(1)
-    row_data = [
-        job_no,
-        round(float(man_days_available), 2),
-        round(float(actual_used), 2),
-        round(float(days_saved), 2),
-        float(bonus_rate),
-        round(float(total_bonus_pool), 2),
-        round(float(bonus_per_painter), 2),
-        str(date.today()),
-    ]
-
-    if job_no in job_nos:
-        row_idx = job_nos.index(job_no) + 1
-        ws.update(f"A{row_idx}:H{row_idx}", [row_data], value_input_option="USER_ENTERED")
-    else:
-        ws.append_row(row_data, value_input_option="USER_ENTERED")
-
-
 def get_bonus_log():
-    """Return all bonus log entries as a DataFrame."""
-    sp = _connect()
-    ws = sp.worksheet(SHEET_BONUS_LOG)
-    data = ws.get_all_records()
-    if not data:
-        return pd.DataFrame(columns=BONUS_LOG_HEADERS)
-    return pd.DataFrame(data)
+    return _read_dataframe("Bonus_Log")
 
-
-# ---------------------------------------------------------------------------
-# Dashboard helpers
-# ---------------------------------------------------------------------------
 
 def get_job_history():
-    """Return merged jobs + bonus data for dashboard charts."""
     jobs = get_all_jobs()
-    bonus = get_bonus_log()
+    clients = get_all_clients()
     if jobs.empty:
         return jobs
-    if bonus.empty:
+    if clients.empty or "client" not in clients.columns:
         return jobs
-    merged = jobs.merge(bonus, on="Job No", how="left", suffixes=("", "_bonus"))
-    return merged
+    return jobs.merge(clients, on="client", how="left", suffixes=("", "_client"))
+
+
+# ====================== CUSTOM RATES ======================
+def save_custom_rates(item_rates_dict, item_units_dict, default_job_notes_dict):
+    if not is_configured():
+        raise RuntimeError("Google Sheets is not configured")
+    date_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
+    for sort_order, (item, rates) in enumerate(item_rates_dict.items(), start=1):
+        rows.append(
+            {
+                "sort_order": sort_order,
+                "item": item,
+                "unit": item_units_dict.get(item, "m²"),
+                "material": rates.get("material", 0),
+                "labour": rates.get("labour", 0),
+                "default_job_notes": default_job_notes_dict.get(item, ""),
+                "date_updated": date_updated,
+            }
+        )
+    _replace_sheet("Custom_Rates", rows)
+
+
+def load_custom_rates():
+    if not is_configured():
+        return {}, {}, {}, {}
+    df = _read_dataframe("Custom_Rates")
+    if df.empty:
+        return {}, {}, {}, {}
+
+    if "sort_order" in df.columns:
+        df = df.sort_values(["sort_order", "item"], na_position="last")
+    else:
+        df = df.sort_values("item")
+
+    item_rates = {}
+    item_units = {}
+    default_notes = {}
+    sort_orders = {}
+    for _, row in df.iterrows():
+        item = str(row.get("item", "") or "").strip()
+        if not item:
+            continue
+        item_rates[item] = {
+            "material": float(row.get("material", 0) or 0),
+            "labour": float(row.get("labour", 0) or 0),
+        }
+        item_units[item] = str(row.get("unit", "m²") or "m²")
+        default_notes[item] = str(row.get("default_job_notes", "") or "")
+        sort_orders[item] = int(row.get("sort_order") or 0)
+    return item_rates, item_units, default_notes, sort_orders
+
+
+# ====================== ADDITIONAL RATES ======================
+def save_custom_additional_rates(rows):
+    if not is_configured():
+        raise RuntimeError("Google Sheets is not configured")
+    date_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    payload = []
+    for row in rows:
+        payload.append(
+            {
+                "sort_order": int(row["sort_order"]),
+                "item": row["item"],
+                "rate_unit": row["rate_unit"],
+                "rate_value": float(row["rate_value"]),
+                "date_updated": date_updated,
+            }
+        )
+    _replace_sheet("Additional_Rates", payload)
+
+
+def load_custom_additional_rates():
+    if not is_configured():
+        return []
+    df = _read_dataframe("Additional_Rates")
+    if df.empty:
+        return []
+    if "sort_order" in df.columns:
+        df = df.sort_values(["sort_order", "item", "rate_unit"])
+    return [
+        {
+            "sort_order": int(row["sort_order"]),
+            "item": row["item"],
+            "rate_unit": row["rate_unit"],
+            "rate_value": float(row["rate_value"]),
+        }
+        for _, row in df.iterrows()
+    ]

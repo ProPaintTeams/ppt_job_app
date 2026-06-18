@@ -74,16 +74,7 @@ def main():
         print("  streamlit run ppt_job_app.py")
     except Exception as e:
         print(f"\nERROR connecting: {e}")
-        err = str(e)
-        if "Invalid JWT Signature" in err or "invalid_grant" in err:
-            print()
-            print("Your credentials.json key is not accepted by Google.")
-            print("This usually means the key was deleted or regenerated in Google Cloud.")
-            print("Fix: Google Cloud Console → APIs & Services → Credentials →")
-            print("     your service account → Keys → Add Key → Create new key (JSON)")
-            print("     Replace credentials.json with the new download, then run this again.")
-        else:
-            print("Make sure you shared the spreadsheet with the service account email above.")
+        print("Make sure you shared the spreadsheet with the service account email above.")
 
 
 if __name__ == "__main__":

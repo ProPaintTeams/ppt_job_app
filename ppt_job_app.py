@@ -1,1707 +1,457 @@
 import hashlib
 import json
 import re
-import sys
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import os
-import shutil
 import smtplib
-import tempfile
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 from datetime import date
 from io import BytesIO
+from urllib.parse import quote as _url_quote
+import secrets
+import time
 
-import db_local
-
-try:
-    import pythoncom
-except ImportError:
-    pythoncom = None
+import db_sheets
+from pdf_linux import generate_letterhead_pdf, generate_quote_pdf
 
 st.set_page_config(page_title="Pro Paint Teams Job/Site Worksheet", layout="wide")
-st.title("Pro Paint Teams Job/Site Worksheet App")
-st.caption("Version 2.7 – Master Rates: paint specs + additionals, edit in form, save to sort & store")
 
-DB_READY = True
-WINDOWS_COM_AVAILABLE = pythoncom is not None
+# ---- One-time auth-token store (for new-tab quote links) ----
+# Uses st.cache_resource so the dict is a true singleton that survives
+# Streamlit script reruns (module-level dicts get reset on every rerun).
+_AUTH_TOKEN_TTL = 3600  # seconds (1 hour)
+
+# ---- Persistent session-token store (for page reload auth) ----
+_SESSION_TOKEN_TTL = 8 * 3600  # 8 hours in seconds
+
+
+@st.cache_resource
+def _get_auth_token_store() -> dict:
+    """Singleton dict: token -> (expiry_monotonic, quote_no). Persists across reruns."""
+    return {}
+
+
+@st.cache_resource
+def _get_session_store() -> dict:
+    """Singleton dict: session_token -> expiry_monotonic. Persists across reruns."""
+    return {}
+
+
+def _create_auth_token(job_no: str) -> str:
+    """Mint a one-time token that grants full auth + opens a specific quote."""
+    store = _get_auth_token_store()
+    _prune_auth_tokens(store)
+    token = secrets.token_urlsafe(32)
+    store[token] = (time.monotonic() + _AUTH_TOKEN_TTL, str(job_no))
+    return token
+
+
+def _redeem_auth_token(token: str) -> str | None:
+    """Validate a token. Returns quote_no on success, None if invalid/expired.
+    Token stays valid until its TTL expires so refreshing the tab keeps working."""
+    store = _get_auth_token_store()
+    _prune_auth_tokens(store)
+    entry = store.get(token)
+    if entry and entry[0] > time.monotonic():
+        return entry[1]
+    return None
+
+
+def _prune_auth_tokens(store: dict | None = None) -> None:
+    if store is None:
+        store = _get_auth_token_store()
+    now = time.monotonic()
+    expired = [k for k, (exp, _) in list(store.items()) if exp <= now]
+    for k in expired:
+        del store[k]
+
+
+def _create_session_token() -> str:
+    """Mint a long-lived session token and add it to the URL so page reloads
+    don't prompt for the password again."""
+    store = _get_session_store()
+    _prune_session_tokens(store)
+    token = secrets.token_urlsafe(32)
+    store[token] = time.monotonic() + _SESSION_TOKEN_TTL
+    return token
+
+
+def _validate_session_token(token: str) -> bool:
+    """Return True if token exists and has not expired."""
+    store = _get_session_store()
+    exp = store.get(token)
+    if not exp:
+        return False
+    if time.monotonic() > exp:
+        del store[token]
+        return False
+    return True
+
+
+def _prune_session_tokens(store: dict | None = None) -> None:
+    if store is None:
+        store = _get_session_store()
+    now = time.monotonic()
+    expired = [k for k, exp in list(store.items()) if exp <= now]
+    for k in expired:
+        del store[k]
+
+
+def _require_app_password():
+    """Block the app until the user enters the password from Streamlit secrets.
+
+    Supports three silent-auth paths that skip the password form:
+      1. ?auth_token=  – short-lived token for new-tab quote links.
+      2. ?session=     – long-lived (8 h) token written to the URL after login,
+                         so hard page reloads don't re-prompt.
+      3. session_state – already authenticated in this Streamlit session.
+    """
+    # --- 1. quote auth_token (new-tab flow) ---
+    raw_token = (st.query_params.get("auth_token") or "").strip()
+    if raw_token and not st.session_state.get("password_authenticated"):
+        quote_no = _redeem_auth_token(raw_token)
+        if quote_no:
+            st.session_state.password_authenticated = True
+            st.session_state["_standalone_quote"] = quote_no
+            # Fall through — standalone page block intercepts before st.tabs.
+        else:
+            st.error("This link has expired or is invalid. Please ask for a new one.")
+            st.stop()
+
+    # --- 2. persistent session token (page-reload flow) ---
+    raw_session = (st.query_params.get("session") or "").strip()
+    if raw_session and not st.session_state.get("password_authenticated"):
+        if _validate_session_token(raw_session):
+            st.session_state.password_authenticated = True
+        else:
+            # Token expired — remove it from the URL silently, then fall
+            # through to show the password form.
+            try:
+                del st.query_params["session"]
+            except Exception:
+                pass
+
+    # --- 3. already authenticated this session ---
+    if st.session_state.get("password_authenticated"):
+        return
+
+    # --- password form ---
+    try:
+        correct_password = str(st.secrets["password"])
+    except (KeyError, FileNotFoundError, AttributeError):
+        st.error("App password not configured. Add `password` to Streamlit secrets.")
+        st.stop()
+    st.title("Pro Paint Teams Job/Site Worksheet App")
+    st.caption("Version 2.8 – Google Sheets + Linux-compatible PDFs")
+    with st.form("app_login"):
+        entered = st.text_input("Password", type="password")
+        if st.form_submit_button("Enter"):
+            if entered == correct_password:
+                st.session_state.password_authenticated = True
+                # Write a session token to the URL so the next reload skips
+                # the password form for up to 8 hours.
+                sess_token = _create_session_token()
+                st.query_params["session"] = sess_token
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+    st.stop()
+
+
+_require_app_password()
+
+# ---- Standalone quote details page (new-tab auth flow) ----
+_standalone_quote = st.session_state.get("_standalone_quote", "")
+if _standalone_quote:
+    _sa_db_ready = False
+    try:
+        _sa_db_ready = db_sheets.is_configured()
+    except Exception:
+        pass
+
+    if not _sa_db_ready:
+        st.title(f"Quote Details — {_standalone_quote}")
+        st.caption("Pro Paint Teams · authenticated session")
+        st.error("Database not configured — cannot load quote details.")
+    else:
+        try:
+            _sa_history = db_sheets.get_job_history()
+        except Exception as _e:
+            _sa_history = pd.DataFrame()
+
+        if _sa_history.empty:
+            st.title(f"Quote Details — {_standalone_quote}")
+            st.warning("No saved quotes found.")
+        else:
+            if "job_no" in _sa_history.columns:
+                _sa_history["Quote #"] = _sa_history["job_no"].astype(str)
+            _sa_needle = str(_standalone_quote).strip().lower()
+            _sa_matches = _sa_history[
+                _sa_history["Quote #"].astype(str).str.lower() == _sa_needle
+            ]
+            if _sa_matches.empty:
+                st.title(f"Quote Details — {_standalone_quote}")
+                st.warning(f"Quote **{_standalone_quote}** was not found in the database.")
+            else:
+                _sa_row = _sa_matches.iloc[0]
+                _sa_editing = st.session_state.get("_sa_editing", False)
+                _sa_loading = (
+                    st.session_state.get("_sa_saving", False)
+                    or st.session_state.get("_sa_cancelling", False)
+                )
+
+                # ---- Header row: title on left, action buttons on right ----
+                _sa_hdr_l, _sa_hdr_r = st.columns([5, 1])
+                with _sa_hdr_l:
+                    st.title(f"Quote Details — {_standalone_quote}")
+                    st.caption("Pro Paint Teams · authenticated session")
+                with _sa_hdr_r:
+                    st.write("")  # vertical alignment spacer
+                    if not _sa_editing:
+                        if st.button("✏️ Edit", key="sa_pencil_btn", type="secondary",
+                                     use_container_width=True, disabled=_sa_loading):
+                            st.session_state["_sa_editing"] = True
+                            st.rerun()
+                    else:
+                        if st.button("✕ Cancel", key="sa_cancel_btn", type="secondary",
+                                     use_container_width=True, disabled=_sa_loading):
+                            st.session_state["_sa_cancelling"] = True
+                            st.rerun()
+
+                st.divider()
+
+                _sa_qdate = pd.to_datetime(_sa_row.get("start_date", ""), errors="coerce")
+                _sa_saved = pd.to_datetime(_sa_row.get("date_created", ""), errors="coerce")
+                try:
+                    _sa_labour = f"R{float(_sa_row.get('total_labour', 0) or 0):,.2f}"
+                except Exception:
+                    _sa_labour = str(_sa_row.get("total_labour", ""))
+                try:
+                    _sa_md = f"{float(_sa_row.get('man_days_available', 0) or 0):.2f}"
+                except Exception:
+                    _sa_md = str(_sa_row.get("man_days_available", ""))
+
+                if not _sa_editing:
+                    # ---- Read-only view ----
+                    _sa_c1, _sa_c2 = st.columns(2)
+                    with _sa_c1:
+                        st.markdown("**Client**");       st.write(str(_sa_row.get("client", "") or "—"))
+                        st.markdown("**Phone**");        st.write(str(_sa_row.get("phone", "") or "—"))
+                        st.markdown("**Email**");        st.write(str(_sa_row.get("email", "") or "—"))
+                        st.markdown("**Address**");      st.write(str(_sa_row.get("address", "") or "—"))
+                        st.markdown("**Area Manager**"); st.write(str(_sa_row.get("area_manager", "") or "—"))
+                    with _sa_c2:
+                        st.markdown("**Quote Date**")
+                        st.write(_sa_qdate.strftime("%Y-%m-%d") if pd.notna(_sa_qdate) else "—")
+                        st.markdown("**Status**");       st.write(str(_sa_row.get("status", "") or "—"))
+                        st.markdown("**Saved At**")
+                        st.write(_sa_saved.strftime("%Y-%m-%d %H:%M") if pd.notna(_sa_saved) else "—")
+                        st.markdown("**Labour Total**"); st.write(_sa_labour)
+                        st.markdown("**Man-Days**");     st.write(_sa_md)
+
+
+                else:
+                    _sa_saving = st.session_state.get("_sa_saving", False)
+                    _sa_cancelling = st.session_state.get("_sa_cancelling", False)
+
+                    # ---- Phase 3: cancel in progress — freeze UI then revert ----
+                    if _sa_cancelling:
+                        _sa_status_opts = ["Open", "Closed", "Pending", "Cancelled"]
+                        _sa_cur_status = str(_sa_row.get("status", "Open") or "Open")
+                        _sa_fc1, _sa_fc2 = st.columns(2)
+                        with _sa_fc1:
+                            st.text_input("Client",       value=str(_sa_row.get("client", "") or ""),       disabled=True)
+                            st.text_input("Phone",        value=str(_sa_row.get("phone", "") or ""),        disabled=True)
+                            st.text_input("Email",        value=str(_sa_row.get("email", "") or ""),        disabled=True)
+                            st.text_input("Address",      value=str(_sa_row.get("address", "") or ""),      disabled=True)
+                            st.text_input("Area Manager", value=str(_sa_row.get("area_manager", "") or ""), disabled=True)
+                        with _sa_fc2:
+                            st.date_input("Quote Date",
+                                          value=_sa_qdate.date() if pd.notna(_sa_qdate) else date.today(),
+                                          disabled=True)
+                            st.selectbox("Status", options=_sa_status_opts,
+                                         index=_sa_status_opts.index(_sa_cur_status)
+                                         if _sa_cur_status in _sa_status_opts else 0,
+                                         disabled=True)
+                            st.markdown("**Saved At**")
+                            st.write(_sa_saved.strftime("%Y-%m-%d %H:%M") if pd.notna(_sa_saved) else "—")
+                            st.markdown("**Labour Total**"); st.write(_sa_labour)
+                            st.markdown("**Man-Days**");     st.write(_sa_md)
+                        with st.spinner("Cancelling…"):
+                            st.session_state["_sa_cancelling"] = False
+                            st.session_state["_sa_editing"] = False
+                            st.rerun()
+
+                    # ---- Phase 2: perform save with spinner, fields disabled ----
+                    elif _sa_saving:
+                        _sa_d = st.session_state.get("_sa_edit_data", {})
+                        _sa_status_opts = ["Open", "Closed", "Pending", "Cancelled"]
+                        _sa_fc1, _sa_fc2 = st.columns(2)
+                        with _sa_fc1:
+                            st.text_input("Client",       value=_sa_d.get("client", ""),   disabled=True)
+                            st.text_input("Phone",        value=_sa_d.get("phone", ""),    disabled=True)
+                            st.text_input("Email",        value=_sa_d.get("email", ""),    disabled=True)
+                            st.text_input("Address",      value=_sa_d.get("address", ""),  disabled=True)
+                            st.text_input("Area Manager", value=_sa_d.get("area_manager", ""), disabled=True)
+                        with _sa_fc2:
+                            st.date_input("Quote Date", value=_sa_d.get("quote_date", date.today()), disabled=True)
+                            st.selectbox("Status", options=_sa_status_opts,
+                                         index=_sa_status_opts.index(_sa_d.get("status", "Open"))
+                                         if _sa_d.get("status") in _sa_status_opts else 0,
+                                         disabled=True)
+                            st.markdown("**Saved At**")
+                            st.write(_sa_saved.strftime("%Y-%m-%d %H:%M") if pd.notna(_sa_saved) else "—")
+                            st.markdown("**Labour Total**"); st.write(_sa_labour)
+                            st.markdown("**Man-Days**");     st.write(_sa_md)
+
+                        st.divider()
+                        with st.spinner("Saving changes…"):
+                            try:
+                                _sa_job_no = str(_sa_row.get("job_no", "") or "")
+
+                                # Upsert the client by name (creates if new, updates if exists).
+                                db_sheets.save_client(
+                                    _sa_d["client"], _sa_d["phone"],
+                                    _sa_d["email"], _sa_d["address"])
+
+                                # Update only the editable job fields — leave
+                                # total_labour, man_days_available, date_created etc. untouched.
+                                db_sheets.update_job_fields(
+                                    _sa_job_no,
+                                    {
+                                        "job_name":     _sa_d["client"],
+                                        "client":       _sa_d["client"],
+                                        "area_manager": _sa_d["area_manager"],
+                                        "start_date":   str(_sa_d["quote_date"]),
+                                        "status":       _sa_d["status"],
+                                    },
+                                )
+
+                                st.cache_data.clear()
+                                st.session_state["_sa_saving"] = False
+                                st.session_state["_sa_editing"] = False
+                                st.session_state["_standalone_quote"] = _sa_job_no
+                                st.rerun()
+                            except Exception as _sa_err:
+                                st.session_state["_sa_saving"] = False
+                                st.error(f"Save failed: {_sa_err}")
+
+                    else:
+                        # ---- Phase 1: editable form ----
+                        # (only reached when neither saving nor cancelling)
+                        _sa_status_opts = ["Open", "Closed", "Pending", "Cancelled"]
+                        _sa_cur_status = str(_sa_row.get("status", "Open") or "Open")
+
+                        # Callbacks fire BEFORE the rerun, so the loading phase
+                        # renders immediately on the very next pass — no editable
+                        # flash in between.
+                        def _sa_on_save():
+                            st.session_state["_sa_saving"] = True
+                            st.session_state["_sa_edit_data"] = {
+                                "client":       st.session_state.get("_sa_f_client", ""),
+                                "phone":        st.session_state.get("_sa_f_phone", ""),
+                                "email":        st.session_state.get("_sa_f_email", ""),
+                                "address":      st.session_state.get("_sa_f_address", ""),
+                                "area_manager": st.session_state.get("_sa_f_am", ""),
+                                "quote_date":   st.session_state.get("_sa_f_qdate", date.today()),
+                                "status":       st.session_state.get("_sa_f_status", "Open"),
+                            }
+
+                        def _sa_on_cancel():
+                            st.session_state["_sa_cancelling"] = True
+
+                        with st.form("sa_edit_form"):
+                            _sa_fc1, _sa_fc2 = st.columns(2)
+                            with _sa_fc1:
+                                st.text_input(
+                                    "Client", key="_sa_f_client",
+                                    value=str(_sa_row.get("client", "") or ""))
+                                st.text_input(
+                                    "Phone", key="_sa_f_phone",
+                                    value=str(_sa_row.get("phone", "") or ""))
+                                st.text_input(
+                                    "Email", key="_sa_f_email",
+                                    value=str(_sa_row.get("email", "") or ""))
+                                st.text_input(
+                                    "Address", key="_sa_f_address",
+                                    value=str(_sa_row.get("address", "") or ""))
+                                st.text_input(
+                                    "Area Manager", key="_sa_f_am",
+                                    value=str(_sa_row.get("area_manager", "") or ""))
+                            with _sa_fc2:
+                                st.date_input(
+                                    "Quote Date", key="_sa_f_qdate",
+                                    value=_sa_qdate.date() if pd.notna(_sa_qdate) else date.today())
+                                st.selectbox(
+                                    "Status", key="_sa_f_status",
+                                    options=_sa_status_opts,
+                                    index=_sa_status_opts.index(_sa_cur_status)
+                                    if _sa_cur_status in _sa_status_opts else 0,
+                                )
+                                st.markdown("**Saved At**")
+                                st.write(_sa_saved.strftime("%Y-%m-%d %H:%M") if pd.notna(_sa_saved) else "—")
+                                st.markdown("**Labour Total**"); st.write(_sa_labour)
+                                st.markdown("**Man-Days**");     st.write(_sa_md)
+
+                            st.divider()
+                            _sa_sf1, _sa_sf2 = st.columns(2)
+                            with _sa_sf1:
+                                st.form_submit_button(
+                                    "💾 Save Changes", type="primary",
+                                    use_container_width=True, on_click=_sa_on_save)
+                            with _sa_sf2:
+                                st.form_submit_button(
+                                    "Cancel", type="secondary",
+                                    use_container_width=True, on_click=_sa_on_cancel)
+
+    st.stop()
+
+st.title("Pro Paint Teams Job/Site Worksheet App")
+st.caption("Version 2.8 – Google Sheets + Linux-compatible PDFs")
+
+try:
+    DB_READY = db_sheets.is_configured()
+except Exception:
+    DB_READY = False
+if not DB_READY:
+    st.warning(
+        "Google Sheets not configured — cloud save disabled. "
+        "Run setup_sheets.py locally or add secrets on Streamlit Cloud."
+    )
 
 # ====================== HELPER FUNCTIONS ======================
 
-def _app_dir() -> str:
-    """Folder containing ppt_job_app.py, the .exe, or PyInstaller extract."""
-    if getattr(sys, "frozen", False):
-        return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
-    return os.path.dirname(os.path.abspath(__file__))
-
-
-def _looks_like_docx(path: str) -> bool:
-    """Quick check: file exists, has size, and starts with a ZIP (PK) header."""
-    try:
-        if not path or not os.path.isfile(path):
-            return False
-        if os.path.getsize(path) < 100:
-            return False
-        with open(path, "rb") as f:
-            return f.read(2) == b"PK"
-    except PermissionError:
-        # Locked by Word or the IDE – still a real file Word COM can open.
-        try:
-            return os.path.isfile(path) and os.path.getsize(path) >= 100
-        except Exception:
-            return False
-    except Exception:
-        return False
-
-
-def _is_valid_docx(path: str) -> bool:
-    """True when path is a readable .docx zip package."""
-    import zipfile
-
-    if not _looks_like_docx(path):
-        return False
-    try:
-        return zipfile.is_zipfile(path)
-    except PermissionError:
-        # File may be locked (open in Word) – PK header is enough for our purposes.
-        return True
-    except Exception:
-        return False
-
-
-def _resolve_data_file_existing(name: str):
-    """Find a .docx file by name even when locked / not readable by zipfile."""
-    if not name:
-        return None
-    target_lower = name.lower()
-    for base in _docx_search_dirs():
-        if not os.path.isdir(base):
-            continue
-        exact = os.path.abspath(os.path.join(base, name))
-        if _looks_like_docx(exact):
-            return exact
-        try:
-            for entry in os.listdir(base):
-                if entry.lower() != target_lower:
-                    continue
-                path = os.path.abspath(os.path.join(base, entry))
-                if _looks_like_docx(path):
-                    return path
-        except OSError:
-            continue
-    return None
-
-
-def _docx_search_dirs():
-    """Directories to search for template / letterhead .docx files."""
-    dirs = []
-    for d in (_app_dir(), os.getcwd()):
-        if d:
-            abs_d = os.path.abspath(d)
-            if abs_d not in dirs:
-                dirs.append(abs_d)
-    if getattr(sys, "frozen", False):
-        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-        if exe_dir not in dirs:
-            dirs.append(exe_dir)
-    return dirs
-
-
-def _resolve_data_file(name: str):
-    """Find a .docx by name (case-insensitive) in app, exe, MEIPASS, or cwd."""
-    if not name:
-        return None
-    target_lower = name.lower()
-    for base in _docx_search_dirs():
-        if not os.path.isdir(base):
-            continue
-        exact = os.path.abspath(os.path.join(base, name))
-        if _is_valid_docx(exact):
-            return exact
-        try:
-            for entry in os.listdir(base):
-                if entry.lower() != target_lower:
-                    continue
-                path = os.path.abspath(os.path.join(base, entry))
-                if _is_valid_docx(path):
-                    return path
-        except OSError:
-            continue
-    return None
-
-
-def _resolve_template_path():
-    """Return quote template.docx path (Tab 1 only)."""
-    return _resolve_data_file("template.docx") or _resolve_data_file("Template.docx")
-
-
-LETTERHEAD_BASE_DOCX_CANDIDATES = [
-    "Letterhead.docx",
-    "letterhead.docx",
-    "LETTERHEAD.docx",
-]
-
-
-def _resolve_letterhead_base_docx_path(candidates=None):
-    """Base .docx for Tabs 2–5 PDF body (letterhead header added via Word COM)."""
-    names = candidates or LETTERHEAD_BASE_DOCX_CANDIDATES
-    for name in names:
-        path = _resolve_data_file(name)
-        if path:
-            return path
-        path = _resolve_data_file_existing(name)
-        if path:
-            return path
-    return None
-
-def _doc_content_width_inches(doc) -> float:
-    """Printable width between left and right margins (inches)."""
-    section = doc.sections[-1]
-    return (
-        section.page_width.inches
-        - section.left_margin.inches
-        - section.right_margin.inches
-    )
-
-
-def _apply_table_column_widths(table, doc, relative_widths: list, margin_factor: float = 0.98):
-    """Scale relative column weights so the table fits inside page margins."""
-    available = _doc_content_width_inches(doc) * margin_factor
-    total = sum(relative_widths)
-    if total <= 0 or available <= 0:
-        return
-    from docx.shared import Inches
-
-    table.autofit = False
-    scale = available / total
-    for col_idx, rel in enumerate(relative_widths):
-        w = rel * scale
-        for cell in table.columns[col_idx].cells:
-            cell.width = Inches(w)
-
-
-# PDF table column widths (relative numbers; scaled to page by _apply_table_column_widths).
-# Edit the list for each export to change column sizing.
-PDF_COL_WIDTHS_TAB1_QUOTE = [0.70, 0.75, 0.45, 0.70, 0.70, 1.50, 1.25]
-PDF_COL_WIDTHS_TAB3_ATTENDANCE = [1.15] + [0.30] * 31 + [0.50, 0.55]  # Name, days 1–31, Totals, R/value
-# Tab 3 attendance PDF table font (points). Edit here to change PDF table text size.
-ATTENDANCE_PDF_HEADER_PT = 9.0
-ATTENDANCE_PDF_BODY_PT = 8.0
-ATTENDANCE_PDF_SUMMARY_PT = 7.0  # Bottom bonus block (compact for single-page fit)
-
-
-def _force_cell_font_pt(cell, size_pt: float, *, bold: bool = False, center: bool = True):
-    """Set font size on every run in a table cell (OOXML + python-docx for reliable PDF export)."""
-    from docx.shared import Pt
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.oxml import OxmlElement
-    from docx.oxml.ns import qn
-
-    half_pts = str(int(round(float(size_pt) * 2)))
-
-    for paragraph in cell.paragraphs:
-        if center:
-            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        paragraph.paragraph_format.space_before = 0
-        paragraph.paragraph_format.space_after = 0
-        _docx_set_single_spacing(paragraph)
-        if not paragraph.runs and (paragraph.text or "").strip():
-            paragraph.add_run(paragraph.text)
-        for run in paragraph.runs:
-            run.bold = bold
-            run.font.size = Pt(size_pt)
-            r_pr = run._element.get_or_add_rPr()
-            for tag in ("w:sz", "w:szCs"):
-                el = r_pr.find(qn(tag))
-                if el is None:
-                    el = OxmlElement(tag)
-                    r_pr.append(el)
-                el.set(qn("w:val"), half_pts)
-
-
-def _format_attendance_pdf_table(table, doc):
-    """Landscape layout + compact fonts for Tab 3 attendance grid (34 columns)."""
-    from docx.enum.section import WD_ORIENT
-    from docx.shared import Inches
-
-    for section in doc.sections:
-        if section.page_width < section.page_height:
-            section.page_width, section.page_height = section.page_height, section.page_width
-        section.orientation = WD_ORIENT.LANDSCAPE
-        section.left_margin = Inches(0.3)
-        section.right_margin = Inches(0.3)
-        section.top_margin = Inches(0.4)
-        section.bottom_margin = Inches(0.4)
-
-    for r_idx, row in enumerate(table.rows):
-        size_pt = ATTENDANCE_PDF_HEADER_PT if r_idx == 0 else ATTENDANCE_PDF_BODY_PT
-        for cell in row.cells:
-            _force_cell_font_pt(
-                cell,
-                size_pt,
-                bold=(r_idx == 0),
-                center=True,
-            )
-    _apply_table_column_widths(table, doc, PDF_COL_WIDTHS_TAB3_ATTENDANCE)
-
-
-TAB2_JOB_SPEC_LINE_SPACING = 1.0  # Single spacing for all PDF / export downloads
-
-
-def _docx_set_single_spacing(paragraph):
-    """Force Word single line spacing on a paragraph."""
-    from docx.enum.text import WD_LINE_SPACING
-
-    pf = paragraph.paragraph_format
-    pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
-    pf.line_spacing = 1.0
-
-
-def _docx_apply_single_spacing_to_document(doc):
-    """Apply single line spacing to every paragraph in the document body and tables."""
-
-    def _walk(container):
-        for paragraph in container.paragraphs:
-            _docx_set_single_spacing(paragraph)
-        for table in container.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    _walk(cell)
-
-    _walk(doc)
-
-
-def _docx_chain_table_summary_rows(table):
-    """Keep quote total / summary rows together with their labels."""
-    if len(table.rows) < 2:
-        return
-    summary_rows = []
-    for row_idx in range(1, len(table.rows)):
-        row_text = " ".join(cell.text.strip().lower() for cell in table.rows[row_idx].cells)
-        if any(key in row_text for key in ("total", "grand", "sub-total", "subtotal")):
-            summary_rows.append(row_idx)
-    if len(summary_rows) > 1:
-        _docx_chain_table_rows(table, summary_rows[0], summary_rows[-1])
-
-
-def _docx_chain_table_label_with_following_rows(table):
-    """Keep section title rows (e.g. Additionals) with the rows that follow them."""
-    if len(table.rows) < 3:
-        return
-    row_idx = 1
-    while row_idx < len(table.rows):
-        row_text = " ".join(cell.text.strip().lower() for cell in table.rows[row_idx].cells)
-        non_empty = sum(1 for cell in table.rows[row_idx].cells if cell.text.strip())
-        is_label_row = non_empty <= 2 and any(
-            key in row_text
-            for key in ("additional", "paint spec", "specification", "section", "breakdown")
-        )
-        if not is_label_row:
-            row_idx += 1
-            continue
-        end_idx = row_idx + 1
-        while end_idx < len(table.rows):
-            next_text = " ".join(cell.text.strip().lower() for cell in table.rows[end_idx].cells)
-            if any(key in next_text for key in ("total", "grand", "sub-total", "subtotal")):
-                break
-            next_non_empty = sum(1 for cell in table.rows[end_idx].cells if cell.text.strip())
-            if next_non_empty <= 2 and any(
-                key in next_text
-                for key in ("additional", "paint spec", "specification", "section", "breakdown")
-            ):
-                break
-            end_idx += 1
-        if end_idx > row_idx + 1:
-            _docx_chain_table_rows(table, row_idx, end_idx - 1)
-        row_idx = end_idx
-
-
-def _docx_prepare_document_for_export(doc):
-    """Single spacing + keep section blocks, labels, and totals together."""
-    _docx_apply_single_spacing_to_document(doc)
-
-    def _walk_tables(tables):
-        for table in tables:
-            _docx_keep_table_section_groups(table)
-            _docx_chain_table_label_with_following_rows(table)
-            _docx_chain_table_summary_rows(table)
-            for row in table.rows:
-                for cell in row.cells:
-                    if cell.tables:
-                        _walk_tables(cell.tables)
-
-    _walk_tables(doc.tables)
-
-
-def _docx_apply_paragraph_keep(paragraph, *, keep_lines=True, keep_with_next=False):
-    """Set w:keepLines / w:keepNext directly on paragraph OOXML (reliable in PDF export)."""
-    from docx.oxml import OxmlElement
-    from docx.oxml.ns import qn
-
-    p_pr = paragraph._p.get_or_add_pPr()
-    for tag, enabled in (("w:keepLines", keep_lines), ("w:keepNext", keep_with_next)):
-        existing = p_pr.find(qn(tag))
-        if enabled:
-            if existing is None:
-                p_pr.append(OxmlElement(tag))
-        elif existing is not None:
-            p_pr.remove(existing)
-    if keep_lines:
-        paragraph.paragraph_format.keep_together = True
-    if keep_with_next:
-        paragraph.paragraph_format.keep_with_next = True
-
-
-def _docx_keep_with_next_chain(paragraphs):
-    """Keep a sequence of paragraphs on the same page when possible."""
-    if not paragraphs:
-        return
-    for paragraph in paragraphs:
-        _docx_apply_paragraph_keep(paragraph, keep_lines=True, keep_with_next=False)
-    for paragraph in paragraphs[:-1]:
-        _docx_apply_paragraph_keep(paragraph, keep_lines=True, keep_with_next=True)
-
-
-def _docx_set_row_cant_split(row):
-    """Prevent a table row from splitting across pages."""
-    from docx.oxml import OxmlElement
-    from docx.oxml.ns import qn
-
-    tr_pr = row._tr.get_or_add_trPr()
-    if tr_pr.find(qn("w:cantSplit")) is None:
-        tr_pr.append(OxmlElement("w:cantSplit"))
-
-
-def _docx_set_table_borderless(table):
-    """Remove visible borders from a wrapper table used for page-keep blocks."""
-    from docx.oxml import OxmlElement
-    from docx.oxml.ns import qn
-
-    tbl = table._tbl
-    tbl_pr = tbl.tblPr
-    tbl_borders = tbl_pr.find(qn("w:tblBorders"))
-    if tbl_borders is None:
-        tbl_borders = OxmlElement("w:tblBorders")
-        tbl_pr.append(tbl_borders)
-    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
-        edge_tag = qn(f"w:{edge}")
-        edge_el = tbl_borders.find(edge_tag)
-        if edge_el is None:
-            edge_el = OxmlElement(f"w:{edge}")
-            tbl_borders.append(edge_el)
-        edge_el.set(qn("w:val"), "nil")
-
-
-def _docx_set_row_height_auto(row):
-    """Let table rows shrink to content height (avoids large blank gaps)."""
-    from docx.oxml.ns import qn
-
-    tr_pr = row._tr.get_or_add_trPr()
-    tr_height = tr_pr.find(qn("w:trHeight"))
-    if tr_height is not None:
-        tr_pr.remove(tr_height)
-
-
-def _docx_set_table_cant_break(table):
-    """Mark every row in a table so Word keeps each row on one page."""
-    for row in table.rows:
-        _docx_set_row_cant_split(row)
-
-
-def _docx_create_kept_block_cell(doc):
-    """Borderless single-cell table; Word moves the whole block to the next page when needed."""
-    table = doc.add_table(rows=1, cols=1)
-    table.alignment = 0
-    _docx_set_table_borderless(table)
-    _docx_set_table_cant_break(table)
-    _docx_set_row_height_auto(table.rows[0])
-    cell = table.rows[0].cells[0]
-    cell.text = ""
-    return table, cell
-
-
-def _docx_row_last_paragraphs(row):
-    """Last paragraph in each cell of a table row."""
-    paragraphs = []
-    for cell in row.cells:
-        if cell.paragraphs:
-            paragraphs.append(cell.paragraphs[-1])
-    return paragraphs
-
-
-def _docx_chain_table_rows(table, row_start, row_end):
-    """Keep consecutive rows row_start..row_end on the same page when they fit."""
-    if row_end <= row_start:
-        return
-    for row_idx in range(row_start, row_end):
-        for paragraph in _docx_row_last_paragraphs(table.rows[row_idx]):
-            _docx_apply_paragraph_keep(paragraph, keep_lines=True, keep_with_next=True)
-    for paragraph in _docx_row_last_paragraphs(table.rows[row_end]):
-        _docx_apply_paragraph_keep(paragraph, keep_lines=True, keep_with_next=False)
-
-
-def _docx_table_header_map(table):
-    if not table.rows:
-        return {}
-    headers = {}
-    for idx, cell in enumerate(table.rows[0].cells):
-        key = re.sub(r"\s+", " ", cell.text.strip().lower())
-        if key:
-            headers[key] = idx
-    return headers
-
-
-def _docx_table_area_description_col(header_map):
-    for key, idx in header_map.items():
-        if "area" in key and "desc" in key:
-            return idx
-    for key in ("area", "description", "area description"):
-        if key in header_map:
-            return header_map[key]
-    return None
-
-
-def _docx_table_row_area_key(table, row_idx, area_col):
-    if area_col is None or row_idx >= len(table.rows):
-        return None
-    cells = table.rows[row_idx].cells
-    if area_col >= len(cells):
-        return None
-    return re.sub(r"\s+", " ", cells[area_col].text.strip().lower())
-
-
-def _docx_table_row_groups_by_area(table):
-    """Group consecutive data rows sharing the same area description."""
-    if len(table.rows) < 2:
-        return []
-    area_col = _docx_table_area_description_col(_docx_table_header_map(table))
-    if area_col is None:
-        return [[idx] for idx in range(1, len(table.rows))]
-
-    groups = []
-    current = [1]
-    current_key = _docx_table_row_area_key(table, 1, area_col)
-    for row_idx in range(2, len(table.rows)):
-        row_key = _docx_table_row_area_key(table, row_idx, area_col)
-        if row_key and row_key == current_key:
-            current.append(row_idx)
-        else:
-            groups.append(current)
-            current = [row_idx]
-            current_key = row_key
-    groups.append(current)
-    return groups
-
-
-def _docx_keep_table_rows_together(table, *, include_header=True):
-    """Keep each table row on one page (move whole row to next page if needed)."""
-    for row_idx, row in enumerate(table.rows):
-        if row_idx == 0 and not include_header:
-            continue
-        _docx_set_row_cant_split(row)
-
-
-def _docx_keep_table_section_groups(table):
-    """Keep multi-row paint/quote sections together; single rows stay independent."""
-    if len(table.rows) < 2 or len(table.rows[0].cells) >= 20:
-        return
-    _docx_keep_table_rows_together(table)
-    for group in _docx_table_row_groups_by_area(table):
-        start_row = group[0]
-        if start_row > 1:
-            prev_text = " ".join(
-                cell.text.strip().lower() for cell in table.rows[start_row - 1].cells
-            )
-            prev_non_empty = sum(
-                1 for cell in table.rows[start_row - 1].cells if cell.text.strip()
-            )
-            if prev_non_empty <= 2 and any(
-                key in prev_text
-                for key in ("additional", "paint spec", "specification", "section", "breakdown")
-            ):
-                start_row -= 1
-        if len(group) > 1 or start_row < group[0]:
-            _docx_chain_table_rows(table, start_row, group[-1])
-
-
-def _docx_add_grouped_content_lines(doc, lines):
-    """Add text lines as page-break-safe blocks (header, numbered items, signatures)."""
-    blocks = []
-    current = []
-    for line in lines or []:
-        text = str(line).strip()
-        if not text:
-            continue
-        if re.match(r"^\d+\.\s", text) or text.upper().startswith("TERMS AND CONDITIONS"):
-            if current:
-                blocks.append(current)
-                current = []
-            blocks.append([text])
-        elif text.upper().startswith("SIGNED"):
-            if current:
-                blocks.append(current)
-                current = []
-            current.append(text)
-        else:
-            current.append(text)
-    if current:
-        blocks.append(current)
-
-    for block in blocks:
-        _block_table, cell = _docx_create_kept_block_cell(doc)
-        paragraphs = [cell.add_paragraph(line) for line in block]
-        _docx_keep_with_next_chain(paragraphs)
-
-
-def _docx_apply_quote_table_row_keep_together(doc):
-    """Keep quote line-item rows and multi-row sections together in template.docx exports."""
-    _docx_prepare_document_for_export(doc)
-
-
-def _word_enforce_keep_together_before_pdf(doc):
-    """Re-apply keep settings in Word so ExportAsFixedFormat honors page grouping."""
-    _word_prepare_document_for_pdf(doc)
-
-
-def _word_chain_paragraphs_in_range(rng):
-    """Keep all paragraphs in a range on the same page when possible."""
-    try:
-        count = int(rng.Paragraphs.Count)
-    except Exception:
-        return
-    if count < 1:
-        return
-    for idx in range(1, count):
-        para = rng.Paragraphs(idx)
-        para.KeepTogether = True
-        para.KeepWithNext = True
-    rng.Paragraphs(count).KeepTogether = True
-
-
-def _word_row_text(table, row_idx):
-    parts = []
-    try:
-        row = table.Rows(row_idx)
-        for col_idx in range(1, int(table.Columns.Count) + 1):
-            parts.append(
-                row.Cells(col_idx)
-                .Range.Text.replace("\r", "")
-                .replace("\x07", "")
-                .strip()
-                .lower()
-            )
-    except Exception:
-        pass
-    return " ".join(parts)
-
-
-def _word_keep_data_table_together(table):
-    """Group quote/spec rows: labels, area sections, and totals."""
-    try:
-        row_count = int(table.Rows.Count)
-        col_count = int(table.Columns.Count)
-    except Exception:
-        return
-    if row_count < 2 or col_count >= 20:
-        return
-
-    for row_idx in range(1, row_count + 1):
-        try:
-            table.Rows(row_idx).AllowBreakAcrossPages = False
-        except Exception:
-            pass
-
-    area_col = 0
-    for col_idx in range(1, col_count + 1):
-        cell_header = (
-            table.Rows(1)
-            .Cells(col_idx)
-            .Range.Text.replace("\r", "")
-            .replace("\x07", "")
-            .strip()
-            .lower()
-        )
-        if "area" in cell_header and "desc" in cell_header:
-            area_col = col_idx
-            break
-
-    if area_col:
-        groups = []
-        current = [2]
-        prev_area = (
-            table.Rows(2)
-            .Cells(area_col)
-            .Range.Text.replace("\r", "")
-            .replace("\x07", "")
-            .strip()
-            .lower()
-        )
-        for row_idx in range(3, row_count + 1):
-            area = (
-                table.Rows(row_idx)
-                .Cells(area_col)
-                .Range.Text.replace("\r", "")
-                .replace("\x07", "")
-                .strip()
-                .lower()
-            )
-            if area and area == prev_area:
-                current.append(row_idx)
-            else:
-                groups.append(current)
-                current = [row_idx]
-                prev_area = area
-        groups.append(current)
-        for group in groups:
-            start_row = group[0]
-            if start_row > 1:
-                prev_text = _word_row_text(table, start_row - 1)
-                if any(
-                    key in prev_text
-                    for key in ("additional", "paint spec", "specification", "section", "breakdown")
-                ):
-                    start_row -= 1
-            if len(group) > 1 or start_row < group[0]:
-                for chain_row in range(start_row, group[-1]):
-                    row_range = table.Rows(chain_row).Range
-                    last_para = row_range.Paragraphs(row_range.Paragraphs.Count)
-                    last_para.KeepTogether = True
-                    last_para.KeepWithNext = True
-
-    summary_rows = []
-    for row_idx in range(2, row_count + 1):
-        if any(key in _word_row_text(table, row_idx) for key in ("total", "grand", "subtotal", "sub-total")):
-            summary_rows.append(row_idx)
-    if len(summary_rows) > 1:
-        for chain_row in range(summary_rows[0], summary_rows[-1]):
-            row_range = table.Rows(chain_row).Range
-            last_para = row_range.Paragraphs(row_range.Paragraphs.Count)
-            last_para.KeepTogether = True
-            last_para.KeepWithNext = True
-
-    row_idx = 2
-    while row_idx < row_count:
-        row_text = _word_row_text(table, row_idx)
-        if any(
-            key in row_text
-            for key in ("additional", "paint spec", "specification", "section", "breakdown")
-        ):
-            end_idx = row_idx + 1
-            while end_idx < row_count:
-                next_text = _word_row_text(table, end_idx)
-                if any(key in next_text for key in ("total", "grand", "subtotal", "sub-total")):
-                    break
-                if any(
-                    key in next_text
-                    for key in ("additional", "paint spec", "specification", "section", "breakdown")
-                ):
-                    break
-                end_idx += 1
-            if end_idx > row_idx + 1:
-                for chain_row in range(row_idx, end_idx - 1):
-                    row_range = table.Rows(chain_row).Range
-                    last_para = row_range.Paragraphs(row_range.Paragraphs.Count)
-                    last_para.KeepTogether = True
-                    last_para.KeepWithNext = True
-            row_idx = end_idx
-        else:
-            row_idx += 1
-
-
-def _word_for_each_table(root, callback):
-    """Visit every table, including tables nested inside cells."""
-
-    def _walk(parent):
-        try:
-            tables = parent.Tables
-            table_count = int(tables.Count)
-        except Exception:
-            return
-        for idx in range(1, table_count + 1):
-            table = tables(idx)
-            callback(table)
-            try:
-                row_count = int(table.Rows.Count)
-                col_count = int(table.Columns.Count)
-            except Exception:
-                continue
-            for row_idx in range(1, row_count + 1):
-                for col_idx in range(1, col_count + 1):
-                    try:
-                        _walk(table.Rows(row_idx).Cells(col_idx))
-                    except Exception:
-                        pass
-
-    _walk(root)
-
-
-def _word_prepare_document_for_pdf(doc):
-    """Re-apply keep settings on all tables (including nested blocks) before PDF export."""
-
-    def _handle_table(table):
-        try:
-            row_count = int(table.Rows.Count)
-            col_count = int(table.Columns.Count)
-        except Exception:
-            return
-        if row_count < 1:
-            return
-
-        if row_count == 1 and col_count == 1:
-            row = table.Rows(1)
-            row.AllowBreakAcrossPages = False
-            _word_chain_paragraphs_in_range(row.Range)
-            return
-
-        if col_count < 20:
-            _word_keep_data_table_together(table)
-            for row_idx in range(1, row_count + 1):
-                try:
-                    _word_chain_paragraphs_in_range(table.Rows(row_idx).Range)
-                except Exception:
-                    pass
-
-    try:
-        _word_for_each_table(doc, _handle_table)
-    except Exception:
-        pass
-
-
-def _tab2_pdf_set_spacing(paragraph, space_before=0, space_after=2):
-    """Single line spacing with compact paragraph gaps for PDF export."""
-    from docx.shared import Pt
-
-    pf = paragraph.paragraph_format
-    if space_before:
-        pf.space_before = Pt(space_before)
-    if space_after is not None:
-        pf.space_after = Pt(space_after)
-    _docx_set_single_spacing(paragraph)
-
-
-def _tab2_pdf_table_row_bottom_rule(table, row_idx=0):
-    """Light full-width horizontal rule under a table row."""
-    from docx.oxml import OxmlElement
-    from docx.oxml.ns import qn
-
-    for cell in table.rows[row_idx].cells:
-        tc_pr = cell._tc.get_or_add_tcPr()
-        tc_bdr = tc_pr.find(qn("w:tcBdr"))
-        if tc_bdr is None:
-            tc_bdr = OxmlElement("w:tcBdr")
-            tc_pr.append(tc_bdr)
-        bottom = OxmlElement("w:bottom")
-        bottom.set(qn("w:val"), "single")
-        bottom.set(qn("w:sz"), "6")
-        bottom.set(qn("w:space"), "0")
-        bottom.set(qn("w:color"), "BFBFBF")
-        tc_bdr.append(bottom)
-
-
-def _tab2_pdf_writing_line(parent):
-    """Blank ruled line for handwritten notes on the Job Spec PDF."""
-    p = parent.add_paragraph("_" * 74)
-    _tab2_pdf_set_spacing(p, space_after=4)
-    return p
-
-
-def _tab2_pdf_no_wrap_cell(cell):
-    """Keep each line in a table cell from wrapping onto the next line."""
-    from docx.oxml import OxmlElement
-    from docx.oxml.ns import qn
-
-    tc_pr = cell._tc.get_or_add_tcPr()
-    if tc_pr.find(qn("w:noWrap")) is None:
-        tc_pr.append(OxmlElement("w:noWrap"))
-
-
-def _tab2_pdf_add_right_info_line(cell, label, value, space_after=3):
-    """Right-aligned label/value line for Job Spec PDF info blocks."""
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-    p = cell.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    _docx_apply_paragraph_keep(p, keep_lines=True, keep_with_next=False)
-    _tab2_pdf_set_spacing(p, space_after=space_after)
-    p.add_run(label).bold = True
-    p.add_run(str(value or ""))
-    return p
-
-
-def _set_tab2_area_desc_cell(cell, area_desc: str, job_notes: str):
-    """Area + Interior/Exterior in bold; job notes in normal text on following line(s)."""
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-    cell.text = ""
-    p = cell.paragraphs[0]
-    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    p.paragraph_format.space_before = 0
-    p.paragraph_format.space_after = 4
-    run = p.add_run(str(area_desc or ""))
-    run.bold = True
-    notes = str(job_notes or "").strip()
-    if notes:
-        p2 = cell.add_paragraph()
-        p2.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        p2.paragraph_format.space_before = 0
-        p2.paragraph_format.space_after = 0
-        p2.add_run(notes)
-
-
-def _render_tab2_job_spec_body(doc, job_no, total_man_days, sections, client_info=None):
-    """Render Tab 2 Job Spec PDF as section blocks (no table), per Quote App template."""
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-    client_info = client_info or {}
-
-    header_table = doc.add_table(rows=2, cols=2)
-    header_table.alignment = 0
-    header_table.autofit = False
-    left_cell, right_cell = header_table.rows[0].cells[0], header_table.rows[0].cells[1]
-    hdr_left, hdr_right = header_table.rows[1].cells[0], header_table.rows[1].cells[1]
-    header_paragraphs = []
-
-    lp = left_cell.paragraphs[0]
-    lp.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    _tab2_pdf_set_spacing(lp, space_after=2)
-    lp.add_run("Customer Info").bold = True
-    header_paragraphs.append(lp)
-    for label, key in (
-        ("Client: ", "client"),
-        ("Phone: ", "phone"),
-        ("Email: ", "email"),
-        ("Address: ", "address"),
-    ):
-        p = left_cell.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        _tab2_pdf_set_spacing(p, space_after=1)
-        p.add_run(label).bold = True
-        p.add_run(str(client_info.get(key, "") or ""))
-        header_paragraphs.append(p)
-
-    rp = right_cell.paragraphs[0]
-    rp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    _tab2_pdf_set_spacing(rp, space_after=2)
-    rp.add_run("Area Manager Info").bold = True
-    header_paragraphs.append(rp)
-    _tab2_pdf_add_right_info_line(
-        right_cell, "Area Manager: ", client_info.get("area_manager", ""), space_after=1
-    )
-    header_paragraphs.append(right_cell.paragraphs[-1])
-    _tab2_pdf_add_right_info_line(
-        right_cell, "Phone: ", client_info.get("am_phone", ""), space_after=1
-    )
-    header_paragraphs.append(right_cell.paragraphs[-1])
-    _tab2_pdf_add_right_info_line(
-        right_cell, "Email: ", client_info.get("am_email", ""), space_after=0
-    )
-    header_paragraphs.append(right_cell.paragraphs[-1])
-
-    hp_left = hdr_left.paragraphs[0]
-    hp_left.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    _tab2_pdf_set_spacing(hp_left, space_after=0)
-    hp_left.add_run("Quote Number: ").bold = True
-    hp_left.add_run(str(job_no or ""))
-    header_paragraphs.append(hp_left)
-
-    hp_right = hdr_right.paragraphs[0]
-    hp_right.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    _tab2_pdf_set_spacing(hp_right, space_after=0)
-    hp_right.add_run("Total Allowed Man-days: ").bold = True
-    hp_right.add_run(f"{float(total_man_days or 0):.2f}")
-    header_paragraphs.append(hp_right)
-
-    _apply_table_column_widths(header_table, doc, [1.0, 1.0], margin_factor=0.98)
-    _tab2_pdf_table_row_bottom_rule(header_table, row_idx=1)
-    _docx_set_table_borderless(header_table)
-    for row in header_table.rows:
-        _docx_set_row_height_auto(row)
-    _docx_chain_table_rows(header_table, 0, 1)
-    _docx_keep_with_next_chain(header_paragraphs)
-
-    hdr_spacer = doc.add_paragraph("")
-    _tab2_pdf_set_spacing(hdr_spacer, space_after=4)
-
-    for sec in sections or []:
-        _section_table, cell = _docx_create_kept_block_cell(doc)
-        section_paragraphs = []
-
-        p_title = cell.add_paragraph()
-        _tab2_pdf_set_spacing(p_title, space_before=6, space_after=2)
-        title_run = p_title.add_run(str(sec.get("title", "")))
-        title_run.bold = True
-        section_paragraphs.append(p_title)
-
-        p_qty = cell.add_paragraph()
-        _tab2_pdf_set_spacing(p_qty, space_after=2)
-        qty_label = p_qty.add_run("Qty: ")
-        qty_label.bold = True
-        p_qty.add_run(str(sec.get("qty_line", "")))
-        section_paragraphs.append(p_qty)
-
-        p_jn = cell.add_paragraph()
-        _tab2_pdf_set_spacing(p_jn, space_after=2)
-        jn_label = p_jn.add_run("Job Notes(steps)")
-        jn_label.bold = True
-        section_paragraphs.append(p_jn)
-
-        steps = sec.get("job_note_steps") or []
-        if not steps:
-            for n in range(1, 4):
-                p_step = cell.add_paragraph(f"{n}. .")
-                _tab2_pdf_set_spacing(p_step, space_after=1)
-                section_paragraphs.append(p_step)
-        else:
-            for n, step in enumerate(steps, 1):
-                p_step = cell.add_paragraph(f"{n}. {step}")
-                _tab2_pdf_set_spacing(p_step, space_after=1)
-                section_paragraphs.append(p_step)
-
-        p_notes = cell.add_paragraph()
-        _tab2_pdf_set_spacing(p_notes, space_before=4, space_after=2)
-        notes_label = p_notes.add_run("Notes:")
-        notes_label.bold = True
-        section_paragraphs.append(p_notes)
-        notes_text = str(sec.get("notes", "") or "").strip()
-        if notes_text:
-            p_prefill = cell.add_paragraph(notes_text)
-            _tab2_pdf_set_spacing(p_prefill, space_after=2)
-            section_paragraphs.append(p_prefill)
-        for _ in range(3):
-            section_paragraphs.append(_tab2_pdf_writing_line(cell))
-
-        p_chk = cell.add_paragraph()
-        _tab2_pdf_set_spacing(p_chk, space_before=4, space_after=2)
-        chk_label = p_chk.add_run("Completed & Checked:")
-        chk_label.bold = True
-        section_paragraphs.append(p_chk)
-        p_sig = cell.add_paragraph(
-            " Name__________________________             Signed___________________________"
-        )
-        _tab2_pdf_set_spacing(p_sig, space_after=0)
-        section_paragraphs.append(p_sig)
-
-        _docx_keep_with_next_chain(section_paragraphs)
-
-        spacer = doc.add_paragraph("")
-        _tab2_pdf_set_spacing(spacer, space_after=8)
-
-
-# ====================== WORD COM: DOCX -> PDF ======================
-def _word_temp_docx_copy(source_path: str) -> str:
-    """Copy a .docx to a temp file so Word can open it even when the original is locked."""
-    abs_path = os.path.abspath(source_path)
-    fd, tmp_path = tempfile.mkstemp(suffix=".docx", prefix="ppt_word_")
-    os.close(fd)
-    shutil.copy2(abs_path, tmp_path)
-    return tmp_path
-
-
-def _word_safe_delete(path: str) -> None:
-    try:
-        if path and os.path.exists(path):
-            os.unlink(path)
-    except Exception:
-        pass
-
-
-def _word_hf_has_content(header_footer) -> bool:
-    """True when a Word header/footer has visible text or shapes (e.g. logo)."""
-    try:
-        if int(header_footer.Shapes.Count) > 0:
-            return True
-    except Exception:
-        pass
-    text = str(header_footer.Range.Text or "")
-    text = text.replace("\r", "").replace("\x07", "").strip()
-    return bool(text)
-
-
-def _word_copy_hf_content(source, dest) -> bool:
-    """Copy header/footer content (including images) from source to dest."""
-    try:
-        dest.Range.FormattedText = source.Range.FormattedText
-        if _word_hf_has_content(dest):
-            return True
-    except Exception:
-        pass
-    try:
-        source.Range.Copy()
-        dest.Range.Paste()
-        return _word_hf_has_content(dest)
-    except Exception:
-        return False
-
-
-def _find_letterhead_docx_path():
-    """Return Letterhead.docx path for Word COM (not template.docx)."""
-    for name in LETTERHEAD_BASE_DOCX_CANDIDATES:
-        path = _resolve_data_file(name) or _resolve_data_file_existing(name)
-        if path:
-            return path
-    return None
-
-
-def _word_header_footer_score(hf) -> int:
-    """Prefer the header/footer with the most letterhead content."""
-    score = 0
-    try:
-        text = str(hf.Range.Text or "").replace("\r", "").replace("\x07", "").strip()
-        score += len(text) * 20
-        score += int(hf.Range.InlineShapes.Count) * 8
-        score += int(hf.Shapes.Count) * 8
-        score += int(hf.Range.Characters.Count)
-    except Exception:
-        pass
-    return score
-
-
-def _word_best_source_header_footer(section, hf_kind):
-    """Pick the richest header/footer (primary usually has logo + contact text)."""
-    collection = getattr(section, hf_kind)
-    best_hf = None
-    best_score = 0
-    for hf_type in (1, 2, 3):  # primary, first page, even
-        try:
-            hf = collection(hf_type)
-            score = _word_header_footer_score(hf)
-            if score > best_score:
-                best_score = score
-                best_hf = hf
-        except Exception:
-            continue
-    return best_hf if best_score > 0 else None
-
-
-def _word_clear_header_footer(hf):
-    try:
-        hf.LinkToPrevious = False
-    except Exception:
-        pass
-    try:
-        rng = hf.Range
-        if int(rng.End) - int(rng.Start) > 1:
-            clip = rng.Duplicate
-            clip.MoveEnd(1, -1)  # keep final paragraph mark
-            if int(clip.End) > int(clip.Start):
-                clip.Delete()
-    except Exception:
-        try:
-            hf.Range.Text = ""
-        except Exception:
-            pass
-
-
-def _word_hf_types():
-    return (1, 2, 3)  # primary first when a simple scan is needed
-
-
-def _word_source_header_footer(section, hf_kind):
-    """Header/footer from a section that contains letterhead."""
-    return _word_best_source_header_footer(section, hf_kind)
-
-
-def _word_copy_range_to_header_footer(source_range, dest_hf) -> bool:
-    """Copy a Word range (header or body) into a header/footer."""
-    try:
-        dest_hf.LinkToPrevious = False
-        dest_hf.Range.Delete()
-    except Exception:
-        pass
-    try:
-        dest_hf.Range.FormattedText = source_range.FormattedText
-        if _word_hf_has_content(dest_hf):
-            return True
-    except Exception:
-        pass
-    try:
-        source_range.Copy()
-        dest_hf.Range.Paste()
-        return _word_hf_has_content(dest_hf)
-    except Exception:
-        return False
-
-
-def _word_copy_letterhead_header_footer(source_hf, dest_hf) -> bool:
-    """Copy header/footer including floating logo shapes."""
-    try:
-        dest_hf.LinkToPrevious = False
-        dest_hf.Range.Delete()
-    except Exception:
-        pass
-    if _word_copy_hf_content(source_hf, dest_hf):
-        return True
-    try:
-        word = source_hf.Application
-        source_hf.Range.Copy()
-        dest_hf.Range.Paste()
-        if _word_hf_has_content(dest_hf):
-            return True
-    except Exception:
-        pass
-    try:
-        dest_hf.Range.FormattedText = source_hf.Range.FormattedText
-        return _word_hf_has_content(dest_hf)
-    except Exception:
-        return False
-
-
-def _word_body_letterhead_range(source_sec):
-    """Top-of-body letterhead block when headers are empty."""
-    try:
-        for hf_kind in ("Headers", "Footers"):
-            if _word_source_header_footer(source_sec, hf_kind) is not None:
-                return None
-    except Exception:
-        pass
-    try:
-        body = source_sec.Range.Duplicate
-        body.Collapse(1)  # wdCollapseStart
-        top_end = body.Start + int(source_sec.PageSetup.PageHeight * 0.28)
-        body.End = min(top_end, source_sec.Range.End)
-        text = str(body.Text or "").replace("\r", "").replace("\x07", "").strip()
-        if text or int(body.InlineShapes.Count) > 0:
-            return body
-    except Exception:
-        pass
-    return None
-
-
-def _apply_letterhead_before_pdf(doc, *, letterhead_path=None) -> None:
-    """Inject page-1 letterhead from Letterhead.docx via Word COM (never raises)."""
-    letterhead_path = letterhead_path or _find_letterhead_docx_path()
-    if not letterhead_path or not _looks_like_docx(letterhead_path):
-        return
-
-    wd_first = 2
-    wd_primary = 1
-    lh_doc = None
-    tmp_lh_path = None
-    try:
-        try:
-            tmp_lh_path = _word_temp_docx_copy(letterhead_path)
-            open_path = tmp_lh_path
-        except Exception:
-            open_path = os.path.abspath(letterhead_path)
-
-        word = doc.Application
-        lh_doc = word.Documents.Open(
-            FileName=open_path,
-            ConfirmConversions=False,
-            ReadOnly=True,
-            AddToRecentFiles=False,
-            NoEncodingDialog=True,
-        )
-
-        source_sec = lh_doc.Sections(1)
-        source_header = _word_best_source_header_footer(source_sec, "Headers")
-        source_footer = _word_best_source_header_footer(source_sec, "Footers")
-
-        for sec_idx in range(1, int(doc.Sections.Count) + 1):
-            target_sec = doc.Sections(sec_idx)
-            try:
-                target_sec.PageSetup.DifferentFirstPageHeaderFooter = True
-                target_sec.PageSetup.HeaderDistance = source_sec.PageSetup.HeaderDistance
-            except Exception:
-                pass
-
-            target_first_header = target_sec.Headers(wd_first)
-            target_primary_header = target_sec.Headers(wd_primary)
-            try:
-                target_first_header.LinkToPrevious = False
-                target_primary_header.LinkToPrevious = False
-            except Exception:
-                pass
-            _word_clear_header_footer(target_primary_header)
-
-            if source_header is not None:
-                _word_copy_letterhead_header_footer(source_header, target_first_header)
-            else:
-                _word_clear_header_footer(target_first_header)
-
-            if source_footer is not None:
-                target_first_footer = target_sec.Footers(wd_first)
-                target_primary_footer = target_sec.Footers(wd_primary)
-                try:
-                    target_first_footer.LinkToPrevious = False
-                    target_primary_footer.LinkToPrevious = False
-                except Exception:
-                    pass
-                _word_clear_header_footer(target_primary_footer)
-                _word_copy_letterhead_header_footer(source_footer, target_first_footer)
-    except Exception:
-        pass
-    finally:
-        if lh_doc is not None:
-            try:
-                lh_doc.Close(False)
-            except Exception:
-                pass
-        _word_safe_delete(tmp_lh_path)
-
-
-def _convert_docx_to_pdf(
-    docx_path: str,
-    pdf_path: str,
-    *,
-    letterhead_first_page_only: bool = False,
-    letterhead_path: str = None,
-) -> None:
-    """Convert .docx to PDF using Word COM (ExportAsFixedFormat, then SaveAs fallback)."""
-    if not WINDOWS_COM_AVAILABLE:
-        raise RuntimeError(
-            "PDF conversion requires Microsoft Word on Windows and is not available in this environment."
-        )
-    from win32com.client import DispatchEx
-
-    docx_abs = os.path.abspath(docx_path)
-    pdf_abs = os.path.abspath(pdf_path)
-    _word_safe_delete(pdf_abs)
-
-    word = None
-    docx_obj = None
-    try:
-        word = DispatchEx("Word.Application")
-        word.Visible = False
-        word.DisplayAlerts = 0
-        try:
-            word.ScreenUpdating = False
-        except Exception:
-            pass
-
-        docx_obj = word.Documents.Open(
-            FileName=docx_abs,
-            ConfirmConversions=False,
-            ReadOnly=False,
-            AddToRecentFiles=False,
-            NoEncodingDialog=True,
-        )
-
-        if letterhead_first_page_only:
-            try:
-                _apply_letterhead_before_pdf(docx_obj, letterhead_path=letterhead_path)
-            except Exception:
-                pass
-
-        try:
-            _word_prepare_document_for_pdf(docx_obj)
-        except Exception:
-            pass
-
-        try:
-            word.Options.PrintBackgrounds = True
-            word.Options.PrintDrawingObjects = True
-        except Exception:
-            pass
-
-        export_err = None
-        try:
-            docx_obj.ExportAsFixedFormat(
-                OutputFileName=pdf_abs,
-                ExportFormat=17,
-                OpenAfterExport=False,
-            )
-        except Exception as e:
-            export_err = e
-            try:
-                docx_obj.SaveAs2(FileName=pdf_abs, FileFormat=17)
-                export_err = None
-            except Exception as e2:
-                export_err = e2
-
-        if export_err is not None:
-            raise RuntimeError(
-                "Word could not export the PDF. Close Letterhead.docx if it is open in Word, "
-                "then try again."
-            ) from export_err
-    finally:
-        if docx_obj is not None:
-            try:
-                docx_obj.Close(False)
-            except Exception:
-                pass
-        if word is not None:
-            try:
-                word.Quit()
-            except Exception:
-                pass
-
-    if not os.path.exists(pdf_abs) or os.path.getsize(pdf_abs) == 0:
-        raise RuntimeError(
-            "Word did not produce a PDF. Check that Microsoft Word is installed "
-            "and not blocked by another open document."
-        )
-
-
-# ====================== FINAL PDF-ONLY HELPER - NO XML CODE ======================
-def generate_letterhead_pdf(
-    tab_title: str,
-    job_no: str,
-    client: str = "",
-    content_lines: list = None,
-    content_pairs: list = None,
-    table_rows: list = None,
-    client_info: dict = None,
-    force_portrait: bool = False,
-    attendance_meta: dict = None,
-    template_candidates: list = None,
-    attendance_table: bool = False,
-    job_spec_sections: list = None,
-    total_man_days: float = None,
-):
-    """Builds .docx with Letterhead + visible table (using only safe high-level code), then converts to PDF using Word COM."""
-    try:
-        from docx import Document
-        import tempfile
-        import os
-        from docx.enum.section import WD_ORIENT
-        from docx.shared import Pt, Inches
-        from docx.enum.text import WD_ALIGN_PARAGRAPH
-        from docx.oxml import OxmlElement
-        from docx.oxml.ns import qn
-
-        def _force_table_borders(docx_table):
-            """Apply explicit borders so PDF export always shows grid lines."""
-            tbl = docx_table._tbl
-            tbl_pr = tbl.tblPr
-            tbl_borders = tbl_pr.find(qn("w:tblBorders"))
-            if tbl_borders is None:
-                tbl_borders = OxmlElement("w:tblBorders")
-                tbl_pr.append(tbl_borders)
-
-            for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
-                edge_tag = qn(f"w:{edge}")
-                edge_el = tbl_borders.find(edge_tag)
-                if edge_el is None:
-                    edge_el = OxmlElement(f"w:{edge}")
-                    tbl_borders.append(edge_el)
-                edge_el.set(qn("w:val"), "single")
-                edge_el.set(qn("w:sz"), "10")      # 10/8 pt line weight
-                edge_el.set(qn("w:space"), "0")
-                edge_el.set(qn("w:color"), "000000")
-
-        def _shade_cell(cell, fill="D9D9D9"):
-            """Apply grey shading to a cell."""
-            tc_pr = cell._tc.get_or_add_tcPr()
-            shd = tc_pr.find(qn("w:shd"))
-            if shd is None:
-                shd = OxmlElement("w:shd")
-                tc_pr.append(shd)
-            shd.set(qn("w:val"), "clear")
-            shd.set(qn("w:color"), "auto")
-            shd.set(qn("w:fill"), fill)
-
-        if not WINDOWS_COM_AVAILABLE:
-            st.error("PDF generation with Word is only available on Windows.")
-            return None
-
-        pythoncom.CoInitialize()
-
-        base_docx_path = _resolve_letterhead_base_docx_path(template_candidates)
-        if base_docx_path and _is_valid_docx(base_docx_path):
-            doc = Document(base_docx_path)
-        elif base_docx_path:
-            try:
-                doc = Document(base_docx_path)
-            except Exception:
-                doc = Document()
-        else:
-            letterhead_only = _find_letterhead_docx_path()
-            if letterhead_only:
-                try:
-                    doc = Document(letterhead_only)
-                except Exception:
-                    doc = Document()
-            else:
-                st.error(
-                    "❌ No Letterhead.docx found in the app folder. "
-                    "Place Letterhead.docx next to ppt_job_app.py (Tab 1 uses template.docx)."
-                )
-                return None
-
-        if force_portrait:
-            for section in doc.sections:
-                # Ensure the exported PDF uses portrait orientation for this document.
-                if section.page_width > section.page_height:
-                    section.page_width, section.page_height = section.page_height, section.page_width
-                section.orientation = WD_ORIENT.PORTRAIT
-
-        # Remove trailing empty paragraphs from template so title sits directly under letterhead.
-        while doc.paragraphs and not doc.paragraphs[-1].text.strip():
-            p = doc.paragraphs[-1]._element
-            p.getparent().remove(p)
-
-        heading = doc.add_heading(tab_title, level=1)
-        heading.paragraph_format.space_before = 0
-        heading.paragraph_format.space_after = 4 if attendance_meta else 6
-        _docx_set_single_spacing(heading)
-
-        # Attendance header: client info (left) + completed date & signature (right).
-        if attendance_meta:
-            info_table = doc.add_table(rows=1, cols=2)
-            info_table.alignment = 0
-            info_table.autofit = False
-            left_cell, right_cell = info_table.rows[0].cells[0], info_table.rows[0].cells[1]
-
-            lp = left_cell.paragraphs[0]
-            lp.paragraph_format.space_after = 2
-            lp.add_run("Client: ").bold = True
-            lp.add_run(str(attendance_meta.get("client", "") or ""))
-            lp2 = left_cell.add_paragraph()
-            lp2.paragraph_format.space_after = 2
-            lp2.add_run("Job: ").bold = True
-            lp2.add_run(str(attendance_meta.get("job_no", "") or ""))
-            lp3 = left_cell.add_paragraph()
-            lp3.paragraph_format.space_after = 0
-            lp3.add_run("Address: ").bold = True
-            lp3.add_run(str(attendance_meta.get("address", "") or ""))
-
-            rp = right_cell.paragraphs[0]
-            rp.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            rp.paragraph_format.space_after = 4
-            rp.add_run("Completed Date: ").bold = True
-            rp2 = right_cell.add_paragraph()
-            rp2.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            rp2.paragraph_format.space_after = 0
-            rp2.add_run("Signature: ").bold = True
-            rp2.add_run(str(attendance_meta.get("signature", "") or ""))
-
-            # 50/50 columns: client left half; date/signature labels left-aligned from page centre.
-            _apply_table_column_widths(info_table, doc, [1.0, 1.0], margin_factor=0.98)
-            _force_table_borders(info_table)
-            _docx_keep_table_rows_together(info_table)
-            spacer = doc.add_paragraph("")
-            spacer.paragraph_format.space_before = 0
-            spacer.paragraph_format.space_after = 2
-
-        # Tab 2 Job Spec: section blocks (no table) per Quote App template.
-        if job_spec_sections is not None:
-            _render_tab2_job_spec_body(
-                doc,
-                job_no,
-                total_man_days,
-                job_spec_sections,
-                {
-                    "client": client,
-                    "phone": (client_info or {}).get("phone", ""),
-                    "email": (client_info or {}).get("email", ""),
-                    "address": (client_info or {}).get("address", ""),
-                    "area_manager": (client_info or {}).get("area_manager", ""),
-                    "am_phone": (client_info or {}).get("am_phone", ""),
-                    "am_email": (client_info or {}).get("am_email", ""),
-                },
-            )
-
-        # Optional generic client info block (used where required).
-        elif client_info:
-            client_info_paragraphs = []
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-            p.add_run(f"Job Number: {job_no}").bold = True
-            client_info_paragraphs.append(p)
-
-            p2 = doc.add_paragraph()
-            p2.add_run("Client: ").bold = True
-            p2.add_run(str(client or ""))
-            p2.add_run("      ")
-            p2.add_run("Phone: ").bold = True
-            p2.add_run(str(client_info.get("phone", "") or ""))
-            p2.add_run("      ")
-            p2.add_run("Email: ").bold = True
-            p2.add_run(str(client_info.get("email", "") or ""))
-            client_info_paragraphs.append(p2)
-
-            p3 = doc.add_paragraph()
-            p3.add_run("Address: ").bold = True
-            p3.add_run(str(client_info.get("address", "") or ""))
-            client_info_paragraphs.append(p3)
-
-            p4 = doc.add_paragraph()
-            p4.add_run("Area Manager: ").bold = True
-            p4.add_run(str(client_info.get("area_manager", "") or ""))
-            client_info_paragraphs.append(p4)
-            _docx_keep_with_next_chain(client_info_paragraphs)
-
-        # Generic body lines for sections that are text based.
-        if content_lines:
-            _docx_add_grouped_content_lines(doc, content_lines)
-
-        # Optional paired label/value rows (two label groups on one line).
-        for pair_row in (content_pairs or []):
-            if not pair_row:
-                continue
-            label1, value1, label2, value2 = pair_row
-            p = doc.add_paragraph()
-            if str(label1).strip():
-                p.add_run(str(label1)).bold = True
-            p.add_run(str(value1))
-            if str(label2).strip():
-                p.add_run("      ")
-                p.add_run(str(label2)).bold = True
-                p.add_run(str(value2))
-            p.paragraph_format.keep_together = True
-
-        # Create table
-        if table_rows:
-            table = doc.add_table(rows=1, cols=len(table_rows[0]))
-            table.alignment = 0  # Left-align table on page.
-
-            # Header
-            hdr_cells = table.rows[0].cells
-            for i, heading in enumerate(table_rows[0]):
-                hdr_cells[i].text = str(heading)
-                for paragraph in hdr_cells[i].paragraphs:
-                    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                    paragraph.paragraph_format.space_before = 0
-                    paragraph.paragraph_format.space_after = 0
-                    for run in paragraph.runs:
-                        run.bold = True
-                _shade_cell(hdr_cells[i], "D9D9D9")
-
-            # Data rows
-            for row_data in table_rows[1:]:
-                row_cells = table.add_row().cells
-                for i, cell_text in enumerate(row_data):
-                    if (
-                        i == 1
-                        and isinstance(cell_text, (tuple, list))
-                        and len(cell_text) >= 2
-                    ):
-                        _set_tab2_area_desc_cell(
-                            row_cells[i], cell_text[0], cell_text[1]
-                        )
-                    else:
-                        row_cells[i].text = str(cell_text)
-                    for paragraph in row_cells[i].paragraphs:
-                        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                        paragraph.paragraph_format.space_before = 0
-                        paragraph.paragraph_format.space_after = 0
-
-            headers = [str(h).strip().lower().rstrip(":") for h in table_rows[0]]
-            is_attendance = attendance_table or (
-                len(headers) >= 34
-                and any(h.startswith("name") for h in headers)
-                and "1" in headers
-                and "31" in headers
-                and any(h.startswith("total") for h in headers)
-            )
-
-            # Table Grid style can reset cell fonts when Word exports to PDF.
-            if not is_attendance:
-                try:
-                    table.style = 'Table Grid'
-                except Exception:
-                    try:
-                        table.style = 'Light Grid'
-                    except Exception:
-                        try:
-                            table.style = 'Grid Table 1 Light'
-                        except Exception:
-                            pass
-
-            if "notes" in headers and "job note" in headers and len(headers) == 7:
-                _apply_table_column_widths(table, doc, PDF_COL_WIDTHS_TAB1_QUOTE)
-            elif is_attendance:
-                _format_attendance_pdf_table(table, doc)
-
-            # Ensure visible borders regardless of Letterhead template styles.
-            _force_table_borders(table)
-            _docx_keep_table_section_groups(table)
-
-            # Attendance summary block under the table.
-            if attendance_meta:
-                man_days_allowed = float(
-                    attendance_meta.get("man_days_allowed", attendance_meta.get("man_days_available", 0)) or 0
-                )
-
-                sum_spacer = doc.add_paragraph("")
-                sum_spacer.paragraph_format.space_before = 0
-                sum_spacer.paragraph_format.space_after = 0
-                summary_table = doc.add_table(rows=5, cols=2)
-                summary_table.alignment = 0
-                summary_table.autofit = False
-
-                labels = [
-                    "Man Days Allowed",
-                    "Man Days Total",
-                    "Bonus Man Days",
-                    "R value of Bonus",
-                    "Bonus per Man Day",
-                ]
-                values = [
-                    f"{man_days_allowed:.1f}",
-                    "",
-                    "",
-                    "",
-                    "",
-                ]
-
-                for idx in range(5):
-                    left = summary_table.rows[idx].cells[0]
-                    right = summary_table.rows[idx].cells[1]
-                    left.text = labels[idx]
-                    right.text = values[idx]
-                    for cell in (left, right):
-                        for paragraph in cell.paragraphs:
-                            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                            paragraph.paragraph_format.space_before = 0
-                            paragraph.paragraph_format.space_after = 0
-                    _force_cell_font_pt(
-                        left, ATTENDANCE_PDF_SUMMARY_PT, bold=True, center=False
-                    )
-                    _force_cell_font_pt(
-                        right, ATTENDANCE_PDF_SUMMARY_PT, bold=False, center=False
-                    )
-
-                _apply_table_column_widths(summary_table, doc, [2.0, 1.0], margin_factor=0.55)
-                _force_table_borders(summary_table)
-                _docx_keep_table_rows_together(summary_table)
-
-        _docx_prepare_document_for_export(doc)
-
-        # Save temp .docx (letterhead first-page-only is applied by Word COM in _convert_docx_to_pdf)
-        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp_docx:
-            tmp_path = tmp_docx.name
-        doc.save(tmp_path)
-
-        tmp_pdf_path = tmp_path.replace(".docx", ".pdf")
-        _convert_docx_to_pdf(
-            tmp_path,
-            tmp_pdf_path,
-            letterhead_first_page_only=True,
-            letterhead_path=_find_letterhead_docx_path(),
-        )
-
-        # Read PDF
-        with open(tmp_pdf_path, "rb") as f:
-            pdf_buffer = BytesIO(f.read())
-
-        # Cleanup
-        os.unlink(tmp_path)
-        if os.path.exists(tmp_pdf_path):
-            os.unlink(tmp_pdf_path)
-
-        pythoncom.CoUninitialize()
-        return pdf_buffer
-
-    except Exception as e:
-        st.error(f"PDF generation error: {e}")
-        try:
-            pythoncom.CoUninitialize()
-        except:
-            pass
-        return None
-
+# Cached loaders
 @st.cache_data(ttl=120, show_spinner=False)
-def _cached_jobs():
-    return db_local.get_all_jobs()
+def _cached_clients(): return db_sheets.get_all_clients()
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_jobs(): return db_sheets.get_all_jobs()
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_quote_areas(job_no=None): return db_sheets.get_quote_areas(job_no)
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_attendance(job_no=None): return db_sheets.get_attendance(job_no)
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_bonus_log(): return db_sheets.get_bonus_log()
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_job_history(): return db_sheets.get_job_history()
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_custom_rates(): return db_sheets.load_custom_rates()
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_additional_rates(): return db_sheets.load_custom_additional_rates()
 
-
-def _clear_db_cache():
+def _clear_cloud_cache():
+    _cached_clients.clear()
     _cached_jobs.clear()
+    _cached_quote_areas.clear()
+    _cached_attendance.clear()
+    _cached_bonus_log.clear()
+    _cached_job_history.clear()
+    _cached_custom_rates.clear()
+    _cached_additional_rates.clear()
 
 def _sort_master_rates_df(df):
     """Ensure # column exists, fill gaps, and sort rows by # (dropdown order)."""
@@ -1754,6 +504,132 @@ def _clear_streamlit_widget_key(key: str):
         del st.session_state[key]
 
 
+_TAB1_WIDGET_KEYS = (
+    "area_code",
+    "am_name",
+    "am_phone",
+    "am_email",
+    "client_select",
+    "client",
+    "client_phone",
+    "client_email",
+    "client_address",
+    "job_no",
+    "quote_date",
+)
+
+
+def _queue_quote_open(quote_data: dict) -> None:
+    """Stage a saved quote for Tab 1 (applied before Tab 1 widgets on next run)."""
+    st.session_state.pending_quote_open = quote_data
+
+
+def _apply_pending_quote_open() -> bool:
+    """Load a queued quote into Tab 1 session state before widgets are created."""
+    pending = st.session_state.pop("pending_quote_open", None)
+    if not pending:
+        return False
+
+    for key in _TAB1_WIDGET_KEYS:
+        _clear_streamlit_widget_key(key)
+    for key in ("paint_sections", "additional_sections"):
+        _clear_streamlit_widget_key(key)
+
+    st.session_state.job_no = str(pending.get("job_no", "") or "")
+    st.session_state.client = str(pending.get("client", "") or "")
+    st.session_state.client_phone = str(pending.get("phone", "") or "")
+    st.session_state.client_email = str(pending.get("email", "") or "")
+    st.session_state.client_address = str(pending.get("address", "") or "")
+    st.session_state.am_name = str(pending.get("area_manager", "") or "")
+    st.session_state.am_phone = str(pending.get("am_phone", "") or "")
+    st.session_state.am_email = str(pending.get("am_email", "") or "")
+    st.session_state.quote_date = pending.get("quote_date", date.today())
+
+    st.session_state["ppt_nav_tab"] = pending.get(
+        "nav_tab", "1. Quote Breakdown (Start Here)"
+    )
+    return True
+
+
+def _quote_row_value(row, *keys, default=""):
+    for key in keys:
+        if key in row.index:
+            val = row.get(key)
+            if pd.notna(val) and str(val).strip():
+                return val
+    return default
+
+
+def _quote_payload_from_display_row(row) -> dict:
+    """Build quote-details payload from a quotes display or table row."""
+    quote_no = str(_quote_row_value(row, "Quote #", "job_no") or "")
+    quote_date_val = _quote_row_value(row, "Quote Date", "start_date")
+    parsed_date = pd.to_datetime(quote_date_val, errors="coerce")
+    labour_raw = _quote_row_value(row, "Labour Total", "total_labour", default=0)
+    man_days_raw = _quote_row_value(row, "Man-Days", "man_days_available", default=0)
+    try:
+        labour_fmt = f"R{float(labour_raw):,.2f}"
+    except (TypeError, ValueError):
+        labour_fmt = str(labour_raw)
+    try:
+        man_days_fmt = f"{float(man_days_raw):.2f}"
+    except (TypeError, ValueError):
+        man_days_fmt = str(man_days_raw)
+    saved_at = _quote_row_value(row, "Saved At", default="")
+    if not saved_at:
+        saved_at = pd.to_datetime(row.get("date_created", ""), errors="coerce")
+        saved_at = saved_at.strftime("%Y-%m-%d %H:%M") if pd.notna(saved_at) else ""
+    return {
+        "job_no": quote_no,
+        "client": str(_quote_row_value(row, "Client", "client") or ""),
+        "phone": str(_quote_row_value(row, "Phone", "phone") or ""),
+        "email": str(_quote_row_value(row, "Email", "email") or ""),
+        "address": str(_quote_row_value(row, "Address", "address") or ""),
+        "area_manager": str(_quote_row_value(row, "Area Manager", "area_manager") or ""),
+        "quote_date": parsed_date.date() if pd.notna(parsed_date) else date.today(),
+        "status": str(_quote_row_value(row, "Status", "status") or ""),
+        "saved_at": str(saved_at),
+        "labour_total": labour_fmt,
+        "man_days": man_days_fmt,
+    }
+
+
+def _find_quote_display_row(display_df: pd.DataFrame, job_no: str):
+    if display_df.empty or not str(job_no or "").strip():
+        return None
+    df = display_df.copy()
+    if "Quote #" not in df.columns and "job_no" in df.columns:
+        df["Quote #"] = df["job_no"].astype(str)
+    needle = str(job_no).strip().lower()
+    matches = df[df["Quote #"].astype(str).str.lower() == needle]
+    if matches.empty and "job_no" in df.columns:
+        matches = df[df["job_no"].astype(str).str.lower() == needle]
+    return matches.iloc[0] if not matches.empty else None
+
+
+def _quote_details_new_tab_href(job_no: str) -> str:
+    """Generate a one-time authenticated URL that opens the given quote in a new tab."""
+    token = _create_auth_token(str(job_no or "").strip())
+    return f"?auth_token={_url_quote(token, safe='')}"
+
+
+def _clear_quote_url_param() -> None:
+    pass  # URL no longer carries quote identity (token was already consumed on load)
+
+
+def _open_quote_details_from_url(display_df: pd.DataFrame) -> bool:
+    """Open quote details when a pending_url_quote has been set by the token-auth flow."""
+    job_no = st.session_state.pop("_pending_url_quote", None)
+    if not job_no:
+        return False
+    row = _find_quote_display_row(display_df, job_no)
+    if row is None:
+        return False
+    st.session_state.quote_details_open = True
+    st.session_state.quote_details_payload = _quote_payload_from_display_row(row)
+    return True
+
+
 def _apply_tab2_editor_edits(base_df, edited_show, area_only, job_notes_col):
     """Merge data_editor output into tab2_spec_df without wiping in-progress cells."""
     out = base_df.copy()
@@ -1780,8 +656,8 @@ def _apply_tab2_editor_edits(base_df, edited_show, area_only, job_notes_col):
 
 
 def _load_master_rates_dataframe():
-    """Load master rates from DB, or built-in hardcoded defaults."""
-    loaded = db_local.load_custom_rates()
+    """Load master rates from DB, or built-in defaults when nothing is saved yet."""
+    loaded = _cached_custom_rates()
     if len(loaded) == 4:
         custom_rates, custom_units, custom_notes, sort_orders = loaded
     else:
@@ -1800,94 +676,6 @@ def _load_master_rates_dataframe():
             for i, item in enumerate(custom_rates)
         ]
         return pd.DataFrame(data)
-    return pd.DataFrame(DEFAULT_MASTER_RATES)
-
-
-_MASTER_RATES_CSV = "2026-06-17T07-33_export.csv"
-_MASTER_RATES_XLSX = "Updated_MasterRates_06152026.xlsx"
-
-
-def _normalize_master_rates_unit(unit) -> str:
-    u = str(unit or "").strip()
-    if u in ("m", "m\u00b2", "m²"):
-        return "m²"
-    return u
-
-
-def _load_master_rates_from_xlsx():
-    """Load paint specification rates from the bundled master rates workbook."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), _MASTER_RATES_XLSX)
-    if not os.path.isfile(path):
-        return None
-    try:
-        df = pd.read_excel(path)
-    except Exception:
-        return None
-    if df is None or df.empty:
-        return None
-    if "#" in df.columns:
-        df = df.sort_values("#", kind="stable")
-    records = []
-    for _, row in df.iterrows():
-        item = str(row.get("Item", "")).strip()
-        if not item:
-            continue
-        sort_n = row.get("#") if "#" in df.columns else len(records) + 1
-        records.append({
-            "#": int(sort_n) if pd.notna(sort_n) else len(records) + 1,
-            "Item": item,
-            "Unit": _normalize_master_rates_unit(row.get("Unit", "m²")),
-            "Material (R/unit)": float(row["Material (R/unit)"]) if pd.notna(row.get("Material (R/unit)")) else 0.0,
-            "Labour (R/unit)": float(row["Labour (R/unit)"]) if pd.notna(row.get("Labour (R/unit)")) else 0.0,
-            "Default Job Notes": str(row.get("Default Job Notes", "") or ""),
-        })
-    return pd.DataFrame(records) if records else None
-
-
-def _load_master_rates_from_csv():
-    """Load paint specification rates from the bundled master rates CSV export."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), _MASTER_RATES_CSV)
-    if not os.path.isfile(path):
-        return None
-
-    df = None
-    for enc in ("utf-8-sig", "cp1252", "latin-1"):
-        try:
-            df = pd.read_csv(path, encoding=enc)
-            break
-        except Exception:
-            df = None
-    if df is None or df.empty:
-        return None
-    if "#" in df.columns:
-        df = df.sort_values("#", kind="stable")
-
-    records = []
-    for _, row in df.iterrows():
-        item = str(row.get("Item", "")).strip()
-        if not item:
-            continue
-        sort_n = row.get("#") if "#" in df.columns else len(records) + 1
-        records.append(
-            {
-                "#": int(sort_n) if pd.notna(sort_n) else len(records) + 1,
-                "Item": item,
-                "Unit": _normalize_master_rates_unit(row.get("Unit", "m²")),
-                "Material (R/unit)": float(row["Material (R/unit)"])
-                if pd.notna(row.get("Material (R/unit)"))
-                else 0.0,
-                "Labour (R/unit)": float(row["Labour (R/unit)"])
-                if pd.notna(row.get("Labour (R/unit)"))
-                else 0.0,
-                "Default Job Notes": str(row.get("Default Job Notes", "") or ""),
-            }
-        )
-
-    return pd.DataFrame(records) if records else None
-
-
-def _load_bundled_master_rates_defaults():
-    """Load hardcoded paint-rate defaults."""
     return pd.DataFrame(DEFAULT_MASTER_RATES)
 
 
@@ -1931,43 +719,68 @@ _MASTER_RATES_EDITOR_KEY = "master_rates_editor"
 
 # Default master rates when nothing is saved in the database yet
 DEFAULT_MASTER_RATES = [
-    {"Item": "High Pressure Washing", "Unit": "each", "Material (R/unit)": 980, "Labour (R/unit)": 700, "Default Job Notes": "NOTE TO CLIENT: This is a noisy process and can be messy. This should not take more than the indicted days and will be cleaned up. Please point out water sources to be used to the Team Leader upon commencment of work.\n•\tHigh pressure wash min pressure 200 bar  \n•\tWash to remove all salt and dirt + Loose material from area. \n•\tWhen working on the roof use safety harness and anchor point for safety. \n•\tUse drop sheet and garbage bags to collect all loose material generated. \n•\tPerform cleanup of the area before commencing to with next step"},
-    {"Item": "Roof Wash", "Unit": "m²", "Material (R/unit)": 12, "Labour (R/unit)": 60, "Default Job Notes": "NOTE TO CLIENT: This is a noisy process and can be messy. This should not take more than the indicted days and will be cleaned up. Please point out water sources to be used to the Team Leader upon commencment of work.\n•\tHigh pressure wash min pressure 200 bar  \n•\tApply 1 coat Midas FUNGICIDAL WASH to all affected areas.\n•\tAllow minimum 24 hours reaction time.\n•\tRemove all growth with a stiff fibre brush.\n•\tApply SECOND coat of FUNGICIDAL WASH.\n•\tDO NOT rinse off the second coat.\n•\tFailure to follow this sequence risks regrowth. \n•\tWhen working on the roof use safety harness and anchor point for safety. \n•\tUse drop sheet and garbage bags to collect all loose material generated. \n•\tPerform cleanup of the area before commencing to with next step"},
-    {"Item": "Plaster Repair", "Unit": "m²", "Material (R/unit)": 80, "Labour (R/unit)": 50, "Default Job Notes": "•\tRemove ALL loose, defective and damaged plaster\n•\tPrime area with 1 coat bonding liquid\n•\tRepair with Paintsmiths PLASTER REPAIR KIT\n•\tDo not exceed 20mm thickness.\n•\tDo not rush curing – insufficient curing leads to failure\n•\tWet plaster 2 times daily or cover with dropsheet after first wetting.\n•\tSmoothen plaster or use a sponge to match existing texture."},
-    {"Item": "Crack Repairs", "Unit": "m²", "Material (R/unit)": 115, "Labour (R/unit)": 70, "Default Job Notes": "•\tRake out all cracks wider than 0.5mm (not hairline cracks)\n•\tPrime with waterproofing slurry kit OR PCT36\n•\tBuild up cracks with REPAIR MIX\n•\tSmoothen or use a sponge to match existing texture\n•\tOpen all expansion joints and seal with All Round Sealer"},
-    {"Item": "Wood Repair", "Unit": "lm", "Material (R/unit)": 50, "Labour (R/unit)": 50, "Default Job Notes": "•\tRemove damaged coating, loose materials or rotten wood.\n•\tSand down reamining wood to uniform matt finish\n•\tPrime all replacement pieces of wood with Wood Primer\n•\tSpot prime nails, hinges and fittings with Metal Etch Primer\n•\tTreat knots or resin marks with Knotting and Wood sealer\n•\tAllow to dry and lightly sand to create a good surface for priming"},
-    {"Item": "Aluminium Restore", "Unit": "each", "Material (R/unit)": 11, "Labour (R/unit)": 35, "Default Job Notes": "•\tRemove all loose contaminents with a soft bristle brush\n•\tSpray Aluminium Cleaner, let soak for 5 to 10min and wipe off\n•\tApply Alu Revivie to a soft fibre cloth and apply in circular motion till dry\n•\tAdd coates of Alu revive till desired finish is achieved"},
-    {"Item": "Mould and Fungi Treatment", "Unit": "m²", "Material (R/unit)": 12, "Labour (R/unit)": 35, "Default Job Notes": "•\tApply 1 coat Midas FUNGICIDAL WASH to all affected areas.\n•\tAllow minimum 24 hours reaction time.\n•\tRemove all growth with a stiff fibre brush.\n•\tApply SECOND coat of FUNGICIDAL WASH.\n•\tDO NOT rinse off the second coat.\n•\tFailure to follow this sequence risks regrowth."},
-    {"Item": "Skimming", "Unit": "m²", "Material (R/unit)": 45, "Labour (R/unit)": 90, "Default Job Notes": "•\tComplete repairs first\n•\tAllow fillers and repairs to dry\n•\tUse a steel trowel and Exterior OR Interior Skimfill to achieve smooth uniform surface\n•\tSand lightly and wipe down before continuing to prime and paint"},
-    {"Item": "Facias/Gutters", "Unit": "lm", "Material (R/unit)": 30, "Labour (R/unit)": 40, "Default Job Notes": "•\tEnsure surfaces are clean inside and out.\n•\tSeal leaks and joints using All Round Sealer, use Peel and Seel for larger gaps\n•\tApply 1 coat of Universal Primer\n•\tApply 2 coats of Midalux 240 (colour to be secified)"},
-    {"Item": "Exterior Walls Paintwork", "Unit": "m²", "Material (R/unit)": 60, "Labour (R/unit)": 35, "Default Job Notes": "•\tPreperation work quoted separately\n•\tRemove all loose contaminents and let dry after Pressure Wash.\n•\tAllow any repair work to fully dry\n•\tSand lightly and remove dust\n•\tSpot prime repairs with Masonry Primer. On new build Prime entire wall with Masonry Primer\n•\tApply 2 coats of Midalux 240 (colour to be specified)"},
-    {"Item": "Exterior Walls- Textured Intermediate", "Unit": "m²", "Material (R/unit)": 78, "Labour (R/unit)": 35, "Default Job Notes": "•\tPreperation work quoted separately\n•\tRemove all loose contaminents and let dry after Pressure Wash.\n•\tAllow any repair work to fully dry\n•\tSand lightly and remove dust\n•\tSpot prime repairs with Masonry Primer. On new build Prime entire wall with Masonry Primer\n•\tApply 1 coat of Midamite Fine/Medium/Coarse to suit existing texture (colour to be specified)\n•\tApply 2 coats of Midalux 240 (colour to be specified)"},
-    {"Item": "Roof Painting", "Unit": "m²", "Material (R/unit)": 80, "Labour (R/unit)": 65, "Default Job Notes": "•\tEnsure roof is dry and clean. Do not paint in high humidity, temperature or probability of mist/rain.\n•\tSpot prime nails, roof screws and metal fittings with Rust Neutrelizer and Metal Etch Primer.\n•\tIf needed apply 1 coat of Primer\n•\tApply 2 coats of Midas Masteroof OR Rubberduck (colour to be specified)"},
-    {"Item": "Windows/Doors- Paint Metal", "Unit": "each", "Material (R/unit)": 185, "Labour (R/unit)": 275, "Default Job Notes": "•\tClean metal with Midas Degreaser\n•\tLighlty sand metal to dull uniform surface\n•\tAdd caulk to frame and wall gaps\n•\tApply 1 coat Metaletch Primer\n•\tApply 1 coat Midaflow Gloss or Midas Masterroof (colour to be specified)"},
-    {"Item": "Windows/ Doors- Paint Wood", "Unit": "each", "Material (R/unit)": 150, "Labour (R/unit)": 225, "Default Job Notes": "•\tIf bare/ new wood present, apply Midas Woodprime to all new surfaces\n•\tLightly sand to uniform colour/appearance\n•\tAdd caulk to frame and wall gaps\n•\tReplace cracking/dry or missing putty. Use Putty Hardener\n•\tSpot prime nails, screws or metal fittings with Metal Etch Primer\n•\tApply 1 coat of Universal Undercoat\n•\tApply 2 coat of Midalux 240 OR 2 coats of Midaflow (ext) WB Non-Drip (int) (colour to be specified)"},
-    {"Item": "Windows/Doors- Timber Preserve", "Unit": "each", "Material (R/unit)": 125, "Labour (R/unit)": 175, "Default Job Notes": "•\tLightly sand to uniform colour/appearance\n•\tAdd caulk to frame and wall gaps\n•\tReplace cracking/dry or missing putty. Use Putty Hardener\n•\tApply 1 coat of Timber Preserve**\n•\tLighlty sand and apply second coat of Timber Preserve**\n**Please note drying time is 48hrs +"},
-    {"Item": "Windows/Doors- Varnish Wood", "Unit": "each", "Material (R/unit)": 175, "Labour (R/unit)": 275, "Default Job Notes": "•\tLightly sand to uniform colour/appearance\n•\tAdd caulk to frame and wall gaps\n•\tReplace cracking/dry or missing putty. Use Putty Hardener\n•\tApply 1 coat of Indoor/Outdoor Varnish and let dry\n•\tLightly sand and apply second coat of Indoor/Outdoor Varnish"},
-    {"Item": "Paint Wood", "Unit": "m²", "Material (R/unit)": 60, "Labour (R/unit)": 45, "Default Job Notes": "•\tIf bare/ new wood present, apply Midas Woodprime to all new surfaces\n•\tLightly sand to uniform colour/appearance\n•\tAdd caulk to frame and wall gaps\n•\tReplace cracking/dry or missing putty. Use Putty Hardener\n•\tSpot prime nails, screws or metal fittings with Metal Etch Primer\n•\tApply 1 coat of Universal Undercoat\n•\tApply 2 coat of Midalux 240 OR 2 coats of Water Based Non-Drip Enamel (colour to be specified)"},
-    {"Item": "Varnish Wood", "Unit": "m²", "Material (R/unit)": 51, "Labour (R/unit)": 55, "Default Job Notes": "•\tLightly sand to uniform colour/appearance\n•\tAdd caulk to frame and wall gaps\n•\tReplace cracking/dry or missing putty. Use Putty Hardener\n•\tApply 1 coat of Indoor/Outdoor Varnish and let dry\n•\tLightly sand and apply second coat of Indoor/Outdoor Varnish"},
-    {"Item": "Timber Preserve", "Unit": "m²", "Material (R/unit)": 70, "Labour (R/unit)": 45, "Default Job Notes": "•\tLightly sand to uniform colour/appearance\n•\tAdd caulk to frame and wall gaps\n•\tReplace cracking/dry or missing putty. Use Putty Hardener\n•\tApply 1 coat of Timber Preserve**\n•\tLighlty sand and apply second coat of Timber Preserve**\n**Please note drying time is 48hrs +"},
-    {"Item": "Paint Galvanised Metal", "Unit": "m²", "Material (R/unit)": 125, "Labour (R/unit)": 45, "Default Job Notes": "•\tLightly sand surface to dull uniform appearance\n•\tApply 1 coat of 504 Surface Tolerant Epoxy as Primer\n•\tAllow 6 to 12 hours (weather depending) to dry before overcoating\n•\tApply 1 coat of 504 Surface Tolerant Epoxy\n•\tAllow to Allow 6 to 12 hours (weather depending) to dry before overcoating\n•\tApply 2 coats of 112 Solvent Based Acrithane Sealer"},
-    {"Item": "Paint Metal", "Unit": "m²", "Material (R/unit)": 75, "Labour (R/unit)": 55, "Default Job Notes": "•\tClean metal with Midas Degreaser\n•\tLighlty sand metal to dull uniform surface\n•\tAdd caulk to frame and wall gaps\n•\tApply 1 coat Metaletch Primer\n•\tApply 1 coat Midaflow Gloss or Midas Masterroof (colour to be specified)"},
-    {"Item": "Interior Walls Paintwork", "Unit": "m²", "Material (R/unit)": 55, "Labour (R/unit)": 35, "Default Job Notes": "•\tIf not skimmed/repaired wash walls with Sugar Soap where contaminated\n•\tLet repairs/wash completely dry\n•\tSand repairs and spot prime with Plaster Primer. On new builds prime entire wall with Plaster Primer\n•\tApply two coats of Midafelt 230 (Colour to be specified)"},
-    {"Item": "Interior Walls- Textured Intermediate", "Unit": "m²", "Material (R/unit)": 72, "Labour (R/unit)": 35, "Default Job Notes": "•\tIf not skimmed/repaired wash walls with Sugar Soap where contaminated\n•\tLet repairs/wash completely dry\n•\tSand repairs and spot prime with Plaster Primer\n•\tApply 1 coat of Midamite Fine/Medium/Coarse to suite existing texture (colour to be specified)\n•\tApply two coats of Midafelt 230 (Colour to be specified)"},
-    {"Item": "Ceiling/Soffits", "Unit": "m²", "Material (R/unit)": 47, "Labour (R/unit)": 55, "Default Job Notes": "•\tWash ceilings where necessary.\n•\tRemove all dust, cobwebs or loose contamination with soft bristle brush.\n•\tCaulk ceilings to cornice or wall.\n•\tFor skimmed ceilings, prime with Midas Plaster Primer.\n•\tApply 2coats of Midafelt 225 (colour to be specified)"},
-    {"Item": "Skirtings", "Unit": "lm", "Material (R/unit)": 45, "Labour (R/unit)": 35, "Default Job Notes": "•\tRemove loose contaminents and wash with Midas Degreaser where neccesary\n•\tAllow to fully dry, then sand lightly to remove gloss and get a uniform finish.\n•\tCaulk skirting where neccesary\n•\tApply 1 coat of Universal Undercoat\n•\tAllow 4 hours for overcoating\n•\tApply 2 coats of Midafelt 225 OR 2 coats of Waterbased Non-drip Enamel (colour to be specified)"},
-    {"Item": "Cornices", "Unit": "lm", "Material (R/unit)": 35, "Labour (R/unit)": 35, "Default Job Notes": "•\tRemove loose contaminents and wash with Midas Degreaser where neccesary\n•\tAllow to fully dry, then sand lightly to remove gloss and get a uniform finish.\n•\tCaulk cornice where neccesary\n•\tApply 1 coat of Universal Undercoat\n•\tAllow 4 hours for overcoating\n•\tApply 2 coats of Midafelt 225 OR 2 coats of Waterbased Non-drip Enamel (colour to be specified)"},
-    {"Item": "Waterproofing Rising Damp/ Horizontals", "Unit": "m²", "Material (R/unit)": 140, "Labour (R/unit)": 80, "Default Job Notes": "•\tRemove all loose contaminants.\n•\tApply 1 coat of Waterpoof Slurry Kit from the floor to +-/ 30cm above the affected area.\n•\tWait 1 to 2 hours and apply second coat of Waterproof Slurry Kit to same area.\n•\tContinue with priming and painting."},
-    {"Item": "Waterproofing Roofs/Concrete Deks", "Unit": "m²", "Material (R/unit)": 135, "Labour (R/unit)": 80, "Default Job Notes": "•\tRemove all loose contaminants and materials.\n•\tApply flashmesh and coat with PCT36 to corners.\n•\tApply two coats of PCT36 Slurry. Ligtly wet concrete before application.\n•\tContinue with priming and painting. PCT must be overcoated with UV resistant coating."},
-    {"Item": "Wood Floors - Sanded to Renew & Varnish", "Unit": "m²", "Material (R/unit)": 105, "Labour (R/unit)": 65, "Default Job Notes": "• Note to Client: This is a dusty process. The complete floor must be done in one stage. The floor must be clear of furniture.\n• Vacuum the floor to remove dust.\n• Apply the first coat of indoor varnish thinned with 10% thinners to penetrate the wood.\n• Sand the first coat with 300-grit sandpaper in circular movements and wipe clean.\n• Apply the final coat. Second painter to lay off the wet varnish to prevent lines -maintaining a wet edge."},
-    {"Item": "Wood Floors- Rails/ Decks Varnish", "Unit": "m²", "Material (R/unit)": 45, "Labour (R/unit)": 55, "Default Job Notes": "• Lightly sand wood to remove loose material and key in the new coat.\n• Apply 2 coats Indoor Varnish for woodwork."},
-    {"Item": "Floors- Tile Remove", "Unit": "each", "Material (R/unit)": 750, "Labour (R/unit)": 350, "Default Job Notes": "•\tNote to Client: Work following tile removal is a provisional part of the quote- Dependant on substrate condition the quote will have to be reassessed.\n•\tLarger cracks, imperfections or soft/powdery tops, may influence the cost of Materials. Provision is made is this quote for smaller cracks and imperfections.\n•\tThis does not include skip rental, quoted under additionals\n•\tRemove tiles\n•\tRake out all cracks and vaccuum to remove loose contamination\n•\tUse anchoring and patching cement to fill all cracks\n•\tGrind open expansion joints in concrete slab and seal with Skifa FC11"},
-    {"Item": "Floors- Cup Grind (Prep)", "Unit": "m²", "Material (R/unit)": 30, "Labour (R/unit)": 45, "Default Job Notes": "Note to Client: Cup grinding is a noisy and dusty process. We recommend to remove all items from the room. We aim to complete the work in the prescribed time.\n•\tThrouogly sweep floor to remove loose conatminents.\n•\tVaccuum floor to remove all dust and finer contaminents.\n•\tPass the cup-grinder once over the area to achieve a level uniform top.\n•\tThe objective is to remove the top layer of concrete to create a key coat for the following steps."},
-    {"Item": "Floors- Cup Grind (Final)", "Unit": "m²", "Material (R/unit)": 75, "Labour (R/unit)": 90, "Default Job Notes": "Note to Client: Cup grinding is a noisy and dusty process. We recommend to remove all items from the room. We aim to complete the work in the prescribed time.\n•\tThrouogly sweep floor to remove loose conatminents.\n•\tVaccuum floor to remove all dust and finer contaminents.\n•\tPass the cup-grinder once over the area to remove high spots\n•\tSweep and vacuum floor to remove all dust\n•\tUsing a straight edge, look for high spots and mark with chalk\n•\tPass over with the cup-grinder for a second time to cut a smooth uniform finish. \n•\tThe objective is to grind down the top to a smooth, flat surface, which can be cleaned and sealed."},
-    {"Item": "Floors- Pigmented Floor Cote", "Unit": "m²", "Material (R/unit)": 750, "Labour (R/unit)": 150, "Default Job Notes": "PREREQUISITES: All building work complete. Concrete min 25 MPa, moisture ≤ 10%. Minimum ambient temp: 15°C.\n•\tApply 1 coat Floor Screed Primer at ±8 m²/L. Allow 4 hours to dry.\n•\tMix full 25 kg of Pigmented Floor Cote bag at once (liquid first, then powder) to a thick, lump-free paste. Must be applied in one continuous session – do not stop mid-section.\n•\tTrowel onto floor at ±3mm thick (4–5 m² per bag). Work towards yourself. Leave slight ridges or use sponge trowel for colour variation.\n•\tAllow 60–90 min to set. Lightly wet with block brush + plastic float (circular motion). \n•\tFinish with light steel trowel. Remove excess slurry immediately.\n•\tAllow 24–48 hours, sand with 200 grit; vacuum. \n•\tApply 1–2 coats Colour Retaining Primer (10 m²/L, 4–6 hrs between).\n•\tAllow to dry overnight\n•\tApply 2–3 coats Acrithane sealer"},
-    {"Item": "Floors- 504 Surface Tolerant Epoxy", "Unit": "m²", "Material (R/unit)": 150, "Labour (R/unit)": 60, "Default Job Notes": "•\tRemove salt contamination with fresh water and Holdtight® 102\n•\tSand and vacuum the floor thoroughly\n•\tMoisture content must be below 15%\n•\tSound old coatings may be left in place\n•\tRemove all filters from spray equipment\n•\tMix 504 Epoxy to 4:1, where 4 parts A and 1 part B.\n•\tApply first coat of 504\n•\tAllow to dry overnight\n•\tApply second Coat of 504 Epoxy\n•\tAllow 24 hours for final coat to cure before light use\n•\tAllow 7 days curing before full use- Do not put down any furnuture on the floor before this time, it will leave marks as Epoxy cures under the weight."},
-    {"Item": "Floors- FC Marble (Cement Application)", "Unit": "m²", "Material (R/unit)": 306, "Labour (R/unit)": 90, "Default Job Notes": "•\tApply 1 coat Floor Coat Screed Primer (D135) at ±8 m²/L\n•\tApply 2 coats Tread FC Marble at max 1mm thickness per coat over 20–25 m² per 8 kg kit\n•\tAllow 4 hours between coats. Sand between coats and vacuum\n•\tApply second coat in same manner. Sand and vacuum final coat before sealing.\n•\tApply 1 coat Colour Retaining Primer at ±10 m²/L. Allow 4–6 hrs drying.\n•\tApply 2 coats Acrithane sealer at ±10 m²/L per coat. Allow 8 hrs between coats. Full cure: 7 days (light traffic after 3 days)."},
-    {"Item": "Floors- FC Marble (Tile Application)", "Unit": "m²", "Material (R/unit)": 465, "Labour (R/unit)": 180, "Default Job Notes": "•\tApply D204 Epoxy Putty on all grout lines of tiles.\n•\tCup grind tiles to remove the glaze to allow mechanical adhesion\n•\tApply 1 coat of 504 Epoxy\n•\tWhile Epoxy cures (2 to 3 hours after application) apply 1 layer of GR.1 sand\n•\tAllow to cure overnight, sweep all loose sand\n•\tApply 1 coat of Floor Screed Primer (D135) at ±8 m²/L\n•\tApply Self-Levelling Screed primer to smooth floor\n•\tSand to remove top laitance, vacuum thorougly\n•\tApply 1 coat of Floor Screed Primer (D135) at ±8 m²/L\n•\tClose all windows and doors to prevent contamination\n•\tSweep and vacuum floors\n•\tApply 2 coats Tread FC Marble at max 1mm thickness per coat over 20–25 m² per 8 kg kit\n•\tAllow 4 hours between coats. Sand between coats and vacuum\n•\tApply second coat in same manner. Sand and vacuum final coat before sealing.\n•\tApply 1 coat Colour Retaining Primer at ±10 m²/L. Allow 4–6 hrs drying.\n•\tApply 2 coats Acrithane sealer at ±10 m²/L per coat. Allow 8 hrs between coats. Full cure: 7 days (light traffic after 3 days)."},
+    {"Item": "Aluminium Restore", "Unit": "each", "Material (R/unit)": 11, "Labour (R/unit)": 35,
+     "Default Job Notes": "•	Remove all loose contaminents with a soft bristle brush\n•	Spray Aluminium Cleaner, let soak for 5 to 10min and wipe off\n•	Apply Alu Revivie to a soft fibre cloth and apply in circular motion till dry\n•	Add coates of Alu revive till desired finish is achieved"},
+    {"Item": "Ceiling/Soffits", "Unit": "m²", "Material (R/unit)": 47, "Labour (R/unit)": 55,
+     "Default Job Notes": "•	Wash ceilings where necessary.\n•	Remove all dust, cobwebs or loose contamination with soft bristle brush.\n•	Caulk ceilings to cornice or wall.\n•	For skimmed ceilings, prime with Midas Plaster Primer.\n•	Apply 2coats of Midafelt 225 (colour to be specified)"},
+    {"Item": "Cornices", "Unit": "lm", "Material (R/unit)": 35, "Labour (R/unit)": 35,
+     "Default Job Notes": "•	Remove loose contaminents and wash with Midas Degreaser where neccesary\n•	Allow to fully dry, then sand lightly to remove gloss and get a uniform finish.\n•	Caulk cornice where neccesary\n•	Apply 1 coat of Universal Undercoat\n•	Allow 4 hours for overcoating\n•	Apply 2 coats of Midafelt 225 OR 2 coats of Waterbased Non-drip Enamel (colour to be specified)"},
+    {"Item": "Crack Repairs", "Unit": "m²", "Material (R/unit)": 30, "Labour (R/unit)": 45,
+     "Default Job Notes": "•	Rake out all cracks wider than 0.5mm (not hairline cracks)\n•	Prime with waterproofing slurry kit OR PCT36\n•	Build up cracks with REPAIR MIX\n•	Smoothen or use a sponge to match existing texture\n•	Open all expansion joints and seal with All Round Sealer"},
+    {"Item": "Cup Grind- Floor Prep", "Unit": "m²", "Material (R/unit)": 30, "Labour (R/unit)": 45,
+     "Default Job Notes": "Note to Client: Cup grinding is a noisy and dusty process. We recommend to remove all items from the room. We aim to complete the work in the prescribed time.\n•	Throuogly sweep floor to remove loose conatminents.\n•	Vaccuum floor to remove all dust and finer contaminents.\n•	Pass the cup-grinder once over the area to achieve a level uniform top.\n•	The objective is to remove the top layer of concrete to create a key coat for the following steps."},
+    {"Item": "Cup Grind- To finish with clear sealer", "Unit": "m²", "Material (R/unit)": 75, "Labour (R/unit)": 90,
+     "Default Job Notes": "Note to Client: Cup grinding is a noisy and dusty process. We recommend to remove all items from the room. We aim to complete the work in the prescribed time.\n•	Throuogly sweep floor to remove loose conatminents.\n•	Vaccuum floor to remove all dust and finer contaminents.\n•	Pass the cup-grinder once over the area to remove high spots\n•	Sweep and vacuum floor to remove all dust\n•	Using a straight edge, look for high spots and mark with chalk\n•	Pass over with the cup-grinder for a second time to cut a smooth uniform finish. \n•	The objective is to grind down the top to a smooth, flat surface, which can be cleaned and sealed."},
+    {"Item": "Exterior Walls Paintwork", "Unit": "m²", "Material (R/unit)": 35, "Labour (R/unit)": 35,
+     "Default Job Notes": "•	Preperation work quoted separately\n•	Remove all loose contaminents and let dry after Pressure Wash.\n•	Allow any repair work to fully dry\n•	Sand lightly and remove dust\n•	Spot prime repairs with Masonry Primer. On new build Prime entire wall with Masonry Primer\n•	Apply 2 coats of Midalux 240 (colour to be specified)"},
+    {"Item": "Facias/Gutters", "Unit": "lm", "Material (R/unit)": 30, "Labour (R/unit)": 25,
+     "Default Job Notes": "•	Ensure surfaces are clean inside and out.\n•	Seal leaks and joints using All Round Sealer, use Peel and Seel for larger gaps\n•	Apply 1 coat of Universal Primer\n•	Apply 2 coats of Midalux 240 (colour to be secified)"},
+    {"Item": "High Pressure Washing", "Unit": "each", "Material (R/unit)": 980, "Labour (R/unit)": 700,
+     "Default Job Notes": "NOTE TO CLIENT: This is a noisy process and can be messy. This should not take more than the indicted days and will be cleaned up. Please point out water sources to be used to the Team Leader upon commencment of work.\n•	High pressure wash min pressure 200 bar  \n•	Wash to remove all salt and dirt + Loose material from area. \n•	When working on the roof use safety harness and anchor point for safety. \n•	Use drop sheet and garbage bags to collect all loose material generated. \n•	Perform cleanup of the area before commencing to with next step"},
+    {"Item": "Interior Skimming", "Unit": "m²", "Material (R/unit)": 75, "Labour (R/unit)": 90,
+     "Default Job Notes": "•	Complete repairs first\n•	Allow fillers and repairs to dry\n•	Use a steel trowel and Interior Skimfill to achieve smooth uniform surface\n•	Sand lightly and wipe down before continuing to prime and paint"},
+    {"Item": "Interior Walls Paintwork", "Unit": "m²", "Material (R/unit)": 35, "Labour (R/unit)": 35,
+     "Default Job Notes": "•	If not skimmed/repaired wash walls with Sugar Soap where contaminated\n•	Let repairs/wash completely dry\n•	Sand repairs and spot prime with Plaster Primer. On new builds prime entire wall with Plaster Primer\n•	Apply two coats of Midafelt 230 (Colour to be specified)"},
+    {"Item": "Mould and Fungi Treatment", "Unit": "m²", "Material (R/unit)": 12, "Labour (R/unit)": 35,
+     "Default Job Notes": "•	Apply 1 coat Midas FUNGICIDAL WASH to all affected areas.\n•	Allow minimum 24 hours reaction time.\n•	Remove all growth with a stiff fibre brush.\n•	Apply SECOND coat of FUNGICIDAL WASH.\n•	DO NOT rinse off the second coat.\n•	Failure to follow this sequence risks regrowth."},
+    {"Item": "Paint Galvanised Metal", "Unit": "m²", "Material (R/unit)": 125, "Labour (R/unit)": 45,
+     "Default Job Notes": "•	Lightly sand surface to dull uniform appearance\n•	Apply 1 coat of 504 Surface Tolerant Epoxy as Primer\n•	Allow 6 to 12 hours (weather depending) to dry before overcoating\n•	Apply 1 coat of 504 Surface Tolerant Epoxy\n•	Allow to Allow 6 to 12 hours (weather depending) to dry before overcoating\n•	Apply 2 coats of 112 Solvent Based Acrithane Sealer"},
+    {"Item": "Paint Metal", "Unit": "m²", "Material (R/unit)": 75, "Labour (R/unit)": 55,
+     "Default Job Notes": "•	Clean metal with Midas Degreaser\n•	Lighlty sand metal to dull uniform surface\n•	Add caulk to frame and wall gaps\n•	Apply 1 coat Metaletch Primer\n•	Apply 1 coat Midaflow Gloss or Midas Masterroof (colour to be specified)"},
+    {"Item": "Paint Metal- Windows/Doors", "Unit": "each", "Material (R/unit)": 185, "Labour (R/unit)": 275,
+     "Default Job Notes": "•	Clean metal with Midas Degreaser\n•	Lighlty sand metal to dull uniform surface\n•	Add caulk to frame and wall gaps\n•	Apply 1 coat Metaletch Primer\n•	Apply 1 coat Midaflow Gloss or Midas Masterroof (colour to be specified)"},
+    {"Item": "Paint Wood", "Unit": "m²", "Material (R/unit)": 60, "Labour (R/unit)": 45,
+     "Default Job Notes": "•	If bare/ new wood present, apply Midas Woodprime to all new surfaces\n•	Lightly sand to uniform colour/appearance\n•	Add caulk to frame and wall gaps\n•	Replace cracking/dry or missing putty. Use Putty Hardener\n•	Spot prime nails, screws or metal fittings with Metal Etch Primer\n•	Apply 1 coat of Universal Undercoat\n•	Apply 2 coat of Midalux 240 OR 2 coats of Water Based Non-Drip Enamel (colour to be specified)"},
+    {"Item": "Paint Wood- Windows/Doors", "Unit": "each", "Material (R/unit)": 150, "Labour (R/unit)": 225,
+     "Default Job Notes": "•	If bare/ new wood present, apply Midas Woodprime to all new surfaces\n•	Lightly sand to uniform colour/appearance\n•	Add caulk to frame and wall gaps\n•	Replace cracking/dry or missing putty. Use Putty Hardener\n•	Spot prime nails, screws or metal fittings with Metal Etch Primer\n•	Apply 1 coat of Universal Undercoat\n•	Apply 2 coat of Midalux 240 OR 2 coats of Midaflow (ext) WB Non-Drip (int) (colour to be specified)"},
+    {"Item": "Plaster Repair", "Unit": "m²", "Material (R/unit)": 80, "Labour (R/unit)": 50,
+     "Default Job Notes": "•	Remove ALL loose, defective and damaged plaster\n•	Prime area with 1 coat bonding liquid\n•	Repair with Paintsmiths PLASTER REPAIR KIT\n•	Do not exceed 20mm thickness.\n•	Do not rush curing – insufficient curing leads to failure\n•	Wet plaster 2 times daily or cover with dropsheet after first wetting.\n•	Smoothen plaster or use a sponge to match existing texture."},
+    {"Item": "Roof Painting", "Unit": "m²", "Material (R/unit)": 55, "Labour (R/unit)": 65,
+     "Default Job Notes": "•	Ensure roof is dry and clean. Do not paint in high humidity, temperature or probability of mist/rain.\n•	Spot prime nails, roof screws and metal fittings with Rust Neutrelizer and Metal Etch Primer.\n•	If needed apply 1 coat of Primer\n•	Apply 2 coats of Midas Masteroof OR Rubberduck (colour to be specified)"},
+    {"Item": "Skimming", "Unit": "m²", "Material (R/unit)": 75, "Labour (R/unit)": 90,
+     "Default Job Notes": "•	Complete repairs first\n•	Allow fillers and repairs to dry\n•	Use a steel trowel and Exterior OR Interior Skimfill to achieve smooth uniform surface\n•	Sand lightly and wipe down before continuing to prime and paint"},
+    {"Item": "Skirtings", "Unit": "lm", "Material (R/unit)": 45, "Labour (R/unit)": 35,
+     "Default Job Notes": "•	Remove loose contaminents and wash with Midas Degreaser where neccesary\n•	Allow to fully dry, then sand lightly to remove gloss and get a uniform finish.\n•	Caulk skirting where neccesary\n•	Apply 1 coat of Universal Undercoat\n•	Allow 4 hours for overcoating\n•	Apply 2 coats of Midafelt 225 OR 2 coats of Waterbased Non-drip Enamel (colour to be specified)"},
+    {"Item": "Tile Remove", "Unit": "m²", "Material (R/unit)": 750, "Labour (R/unit)": 350,
+     "Default Job Notes": "•	Skip Rental\n•	Work following tile removal is a provisional part of the quote- Dependant on substrate condition the quote will have to be reassessed."},
+    {"Item": "Timber Preserve", "Unit": "m²", "Material (R/unit)": 70, "Labour (R/unit)": 45,
+     "Default Job Notes": "•	Lightly sand to uniform colour/appearance\n•	Add caulk to frame and wall gaps\n•	Replace cracking/dry or missing putty. Use Putty Hardener\n•	Apply 1 coat of Timber Preserve**\n•	Lighlty sand and apply second coat of Timber Preserve**\n**Please note drying time is 48hrs +"},
+    {"Item": "Timber Preserve- Windows/Doors", "Unit": "each", "Material (R/unit)": 125, "Labour (R/unit)": 175,
+     "Default Job Notes": "•	Lightly sand to uniform colour/appearance\n•	Add caulk to frame and wall gaps\n•	Replace cracking/dry or missing putty. Use Putty Hardener\n•	Apply 1 coat of Timber Preserve**\n•	Lighlty sand and apply second coat of Timber Preserve**\n**Please note drying time is 48hrs +"},
+    {"Item": "Varnish Wood", "Unit": "m²", "Material (R/unit)": 51, "Labour (R/unit)": 97,
+     "Default Job Notes": "•	Lightly sand to uniform colour/appearance\n•	Add caulk to frame and wall gaps\n•	Replace cracking/dry or missing putty. Use Putty Hardener\n•	Apply 1 coat of Indoor/Outdoor Varnish and let dry\n•	Lightly sand and apply second coat of Indoor/Outdoor Varnish"},
+    {"Item": "Varnish Wood- Windows/Doors", "Unit": "each", "Material (R/unit)": 175, "Labour (R/unit)": 275,
+     "Default Job Notes": "•	Lightly sand to uniform colour/appearance\n•	Add caulk to frame and wall gaps\n•	Replace cracking/dry or missing putty. Use Putty Hardener\n•	Apply 1 coat of Indoor/Outdoor Varnish and let dry\n•	Lightly sand and apply second coat of Indoor/Outdoor Varnish"},
+    {"Item": "Waterproofing Rising Damp/ Horizontals", "Unit": "m²", "Material (R/unit)": 55, "Labour (R/unit)": 36,
+     "Default Job Notes": "•	Remove all loose contaminants.\n•	Apply 1 coat of Waterpoof Slurry Kit from the floor to +-/ 30cm above the affected area.\n•	Wait 1 to 2 hours and apply second coat of Waterproof Slurry Kit to same area.\n•	Continue with priming and painting."},
+    {"Item": "Waterproofing Roofs/Concrete Deks", "Unit": "m²", "Material (R/unit)": 105, "Labour (R/unit)": 55,
+     "Default Job Notes": "•	Remove all loose contaminants and materials.\n•	Apply flashmesh and coat with PCT36 to corners.\n•	Apply two coats of PCT36 Slurry. Ligtly wet concrete before application.\n•	Continue with priming and painting. PCT must be overcoated with UV resistant coating."},
+    {"Item": "Wood Floors – Sanded to Renew & Varnish", "Unit": "m²", "Material (R/unit)": 105, "Labour (R/unit)": 65,
+     "Default Job Notes": "• Note to Client: This is a dusty process. The complete floor must be done in one stage. The floor must be clear of furniture.\n• Vacuum the floor to remove dust.\n• Apply the first coat of indoor varnish thinned with 10% thinners to penetrate the wood.\n• Sand the first coat with 300-grit sandpaper in circular movements and wipe clean.\n• Apply the final coat. Second painter to lay off the wet varnish to prevent lines -maintaining a wet edge."},
+    {"Item": "Wood Floors/Rails/ Decks Varnish", "Unit": "m²", "Material (R/unit)": 45, "Labour (R/unit)": 55,
+     "Default Job Notes": "• Lightly sand wood to remove loose material and key in the new coat.\n• Apply 2 coats Indoor Varnish for woodwork."},
+    {"Item": "Wood Repair", "Unit": "lm", "Material (R/unit)": 50, "Labour (R/unit)": 50,
+     "Default Job Notes": "•	Remove damaged coating, loose materials or rotten wood.\n•	Sand down reamining wood to uniform matt finish\n•	Prime all replacement pieces of wood with Wood Primer\n•	Spot prime nails, hinges and fittings with Metal Etch Primer\n•	Treat knots or resin marks with Knotting and Wood sealer\n•	Allow to dry and lightly sand to create a good surface for priming"},
 ]
 
 
@@ -2048,7 +861,7 @@ def _update_session_additional_rates_from_df(df=None):
 
 
 def _load_master_additional_rates_dataframe():
-    loaded = db_local.load_custom_additional_rates()
+    loaded = _cached_additional_rates()
     if loaded:
         data = [
             {
@@ -2131,10 +944,6 @@ def _get_additional_item_order():
     return list(_get_additional_rates().keys())
 
 
-def _additional_item_has_km(item: str) -> bool:
-    return item in ("Travel", "Delivery")
-
-
 def _additional_section_cost(sec: dict) -> float:
     item = sec.get("item", "")
     rate = _get_additional_rates().get(item, {})
@@ -2150,55 +959,20 @@ def _additional_section_cost(sec: dict) -> float:
 
 
 def _additional_cost_quote_row(sec: dict) -> dict:
-    """Build one additional line for template.docx (docxtpl / Jinja2)."""
     cost = _additional_section_cost(sec)
     item = sec.get("item", "")
-    has_liters = item == "Water Procurement"
-    has_duration = not has_liters
-    has_km = _additional_item_has_km(item)
-
-    row = {
-        "description": item,
-        "cost": f"R{cost:,.2f}",
-        "has_liters": has_liters,
-        "has_duration": has_duration,
-        "has_km": has_km,
-    }
-
-    if has_liters:
+    if item == "Water Procurement":
         liters = int(sec.get("liters", 1000) or 0)
-        row["liters"] = liters
-        row["liters_display"] = f"{liters:,} liters"
-        row["duration_days"] = None
-        row["duration_display"] = ""
-        row["km"] = None
-        row["km_display"] = ""
-    else:
-        row["liters"] = None
-        row["liters_display"] = ""
-        days = int(sec.get("duration_days", 0) or 0)
-        row["duration_days"] = days
-        day_word = "day" if days == 1 else "days"
-        row["duration_display"] = f"{days} {day_word}"
-        if has_km:
-            km = float(sec.get("km", 0) or 0)
-            km_text = str(int(km)) if km == int(km) else str(km)
-            row["km"] = km
-            row["km_display"] = f"{km_text} km"
-        else:
-            row["km"] = None
-            row["km_display"] = ""
-
-    detail_parts = []
-    if has_liters:
-        detail_parts.append(f"Quantity: {row['liters_display']}")
-    elif has_duration:
-        detail_parts.append(f"Duration: {row['duration_display']}")
-    if has_km:
-        detail_parts.append(f"Distance: {row['km_display']}")
-    row["detail_line"] = " | ".join(detail_parts)
-
-    return row
+        return {
+            "description": item,
+            "type": f"{liters} liters",
+            "amount": f"R{cost:,.2f}",
+        }
+    return {
+        "description": item,
+        "type": f"{sec.get('duration_days', 0)} days",
+        "amount": sec.get("km", 0),
+    }
 
 
 def _notes_key_sig(text):
@@ -2413,37 +1187,56 @@ def _download_filename(
     return f"{name}.{ext}"
 
 _TAB_LABELS = [
-    "Master Rates",
     "1. Quote Breakdown (Start Here)",
     "2. Job Spec & Site Man-Days",
     "3. Attendance & Bonus",
     "4. Employment Contract",
     "5. Dashboard",
+    "6. Quotes",
+    "Master Rates",
 ]
 
-tab_master, tab_quote, tab2, tab3, tab4, tab5 = st.tabs(
-    _TAB_LABELS, default="1. Quote Breakdown (Start Here)", key="ppt_nav_tab"
+if "ppt_nav_tab" not in st.session_state:
+    st.session_state["ppt_nav_tab"] = "1. Quote Breakdown (Start Here)"
+
+tab_quote, tab2, tab3, tab4, tab5, tab6, tab_master = st.tabs(
+    _TAB_LABELS, key="ppt_nav_tab"
 )
 
 def get_email_config():
-    """Load full SMTP config from email_config.txt (next to app.py)"""
-    config_file = os.path.join(".", 'email_config.txt')
+    """Load SMTP config from Streamlit secrets or email_config.txt."""
+    try:
+        if "smtp" in st.secrets:
+            s = st.secrets["smtp"]
+            config = {k.lower(): str(v) for k, v in dict(s).items()}
+            if config.get("sender_email") and config.get("password"):
+                if "smtp_server" not in config:
+                    config["smtp_server"] = "mail." + config["sender_email"].split("@")[1]
+                if "smtp_port" not in config:
+                    config["smtp_port"] = "587"
+                if "use_tls" not in config:
+                    config["use_tls"] = "True"
+                return config
+    except Exception:
+        pass
+
+    config_file = os.path.join(".", "email_config.txt")
     if not os.path.exists(config_file):
         return None
     config = {}
-    with open(config_file, 'r', encoding='utf-8') as f:
+    with open(config_file, "r", encoding="utf-8") as f:
         for line in f:
-            if '=' in line:
-                key, value = line.strip().split('=', 1)
+            if "=" in line:
+                key, value = line.strip().split("=", 1)
                 config[key.strip().lower()] = value.strip()
-    if not all(k in config for k in ['sender_email', 'password']):
+    if not all(k in config for k in ["sender_email", "password"]):
         return None
-    if 'smtp_server' not in config:
-        config['smtp_server'] = 'mail.' + config['sender_email'].split('@')[1]
-    if 'smtp_port' not in config:
-        config['smtp_port'] = '587'
-    if 'use_tls' not in config:
-        config['use_tls'] = 'True'
+    if "smtp_server" not in config:
+        config["smtp_server"] = "mail." + config["sender_email"].split("@")[1]
+    if "smtp_port" not in config:
+        config["smtp_port"] = "587"
+    if "use_tls" not in config:
+        config["use_tls"] = "True"
     return config
 
 def send_quote_email(to_email, subject, body, attachment_buf, filename, config):
@@ -2514,8 +1307,7 @@ with tab_master:
     st.header("Master Rates")
     st.caption(
         "Edit rates below — the page will not refresh while you type. "
-        "Use # for row order. Click **Save** to sort rows by # and store permanently in the database. "
-        "Factory defaults are now hardcoded in the app."
+        "Use # for row order. Click **Save** to sort rows by # and store permanently in the database."
     )
 
     if "rates_version" not in st.session_state:
@@ -2546,26 +1338,27 @@ with tab_master:
         edited_df = st.data_editor(
             st.session_state.master_rates_df,
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             key=_MASTER_RATES_EDITOR_KEY,
             column_config=_master_rates_column_config(),
         )
         btn_save, btn_reset, btn_cancel = st.columns(3)
         save_clicked = btn_save.form_submit_button(
-            "💾 Save paint specification rates", type="primary", use_container_width=True
+            "💾 Save paint specification rates", type="primary", width="stretch"
         )
         reset_clicked = btn_reset.form_submit_button(
-            "🔄 Reset paint rates to hardcoded defaults", use_container_width=True
+            "🔄 Reset paint rates to factory defaults", width="stretch"
         )
         cancel_clicked = btn_cancel.form_submit_button(
-            "❌ Cancel / Discard paint rate changes", use_container_width=True
+            "❌ Cancel / Discard paint rate changes", width="stretch"
         )
 
     if save_clicked:
         sorted_df = _prepare_master_rates_df(edited_df)
         _mr, _mu, _mn = _df_to_rate_dicts(sorted_df)
-        db_local.save_custom_rates(_mr, _mu, _mn)
+        db_sheets.save_custom_rates(_mr, _mu, _mn)
+        _clear_cloud_cache()
         st.session_state.master_rates_df = sorted_df
         st.session_state.item_rates_df = sorted_df.copy()
         st.session_state.ITEM_RATES = _mr
@@ -2577,15 +1370,15 @@ with tab_master:
         st.rerun()
 
     if reset_clicked:
-        source_df = _load_bundled_master_rates_defaults()
-        _mr, _mu, _mn = _df_to_rate_dicts(source_df)
-        db_local.save_custom_rates(_mr, _mu, _mn)
-        st.session_state.master_rates_df = _prepare_master_rates_df(source_df)
+        _mr, _mu, _mn = _df_to_rate_dicts(pd.DataFrame(DEFAULT_MASTER_RATES))
+        db_sheets.save_custom_rates(_mr, _mu, _mn)
+        _clear_cloud_cache()
+        st.session_state.master_rates_df = _prepare_master_rates_df(pd.DataFrame(DEFAULT_MASTER_RATES))
         st.session_state.item_rates_df = st.session_state.master_rates_df.copy()
         _update_session_rates_from_df(st.session_state.master_rates_df)
         st.session_state.rates_version += 1
         _clear_streamlit_widget_key(_MASTER_RATES_EDITOR_KEY)
-        st.success("Hardcoded default paint rates restored.")
+        st.success("Factory default paint rates restored.")
         st.rerun()
 
     if cancel_clicked:
@@ -2603,25 +1396,26 @@ with tab_master:
         edited_additional_df = st.data_editor(
             st.session_state.master_additional_rates_df,
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             key=_MASTER_ADDITIONAL_RATES_EDITOR_KEY,
             column_config=_master_additional_rates_column_config(),
         )
         add_btn_save, add_btn_reset, add_btn_cancel = st.columns(3)
         add_save_clicked = add_btn_save.form_submit_button(
-            "💾 Save additional rates", type="primary", use_container_width=True
+            "💾 Save additional rates", type="primary", width="stretch"
         )
         add_reset_clicked = add_btn_reset.form_submit_button(
-            "🔄 Reset additional rates to factory defaults", use_container_width=True
+            "🔄 Reset additional rates to factory defaults", width="stretch"
         )
         add_cancel_clicked = add_btn_cancel.form_submit_button(
-            "❌ Cancel / Discard additional rate changes", use_container_width=True
+            "❌ Cancel / Discard additional rate changes", width="stretch"
         )
 
     if add_save_clicked:
         sorted_additional_df = _prepare_master_additional_rates_df(edited_additional_df)
-        db_local.save_custom_additional_rates(_additional_rates_df_to_db_rows(sorted_additional_df))
+        db_sheets.save_custom_additional_rates(_additional_rates_df_to_db_rows(sorted_additional_df))
+        _clear_cloud_cache()
         st.session_state.master_additional_rates_df = sorted_additional_df
         _update_session_additional_rates_from_df(sorted_additional_df)
         st.session_state.rates_version += 1
@@ -2633,7 +1427,8 @@ with tab_master:
         default_additional_df = _prepare_master_additional_rates_df(
             pd.DataFrame(DEFAULT_MASTER_ADDITIONAL_RATES)
         )
-        db_local.save_custom_additional_rates(_additional_rates_df_to_db_rows(default_additional_df))
+        db_sheets.save_custom_additional_rates(_additional_rates_df_to_db_rows(default_additional_df))
+        _clear_cloud_cache()
         st.session_state.master_additional_rates_df = default_additional_df
         _update_session_additional_rates_from_df(default_additional_df)
         st.session_state.rates_version += 1
@@ -2652,6 +1447,9 @@ with tab_master:
 
 # ====================== TAB 1: QUOTE BREAKDOWN ======================
 with tab_quote:
+    if _apply_pending_quote_open():
+        st.success("Quote loaded from saved records.")
+
     st.title("Pro Paint Teams Quote")
 
     # Live rates from Master Rates (single source of truth)
@@ -2737,7 +1535,7 @@ with tab_quote:
     client_options = ["— New Client —"]
     if DB_READY:
         try:
-            clients_df = db_local.get_all_clients()
+            clients_df = _cached_clients()
             if not clients_df.empty:
                 client_options += sorted(clients_df["client"].astype(str).unique().tolist())
         except: pass
@@ -2746,7 +1544,7 @@ with tab_quote:
         selected = st.session_state.get("client_select")
         if selected == "— New Client —" or not DB_READY: return
         try:
-            clients_df = db_local.get_all_clients()
+            clients_df = _cached_clients()
             row = clients_df[clients_df["client"] == selected].iloc[0]
             st.session_state.client = row.get("client", selected)
             st.session_state.client_phone = row.get("phone", "")
@@ -2763,7 +1561,7 @@ with tab_quote:
     with c_cols[1]:
         client_address = st.text_input("Physical Address", key="client_address")
         job_no = st.text_input("Quote Number", key="job_no")
-        quote_date = st.date_input("Date of Quote", value=date.today(), key="quote_date")
+        quote_date = st.date_input("Date of Quote", key="quote_date")
 
     # Paint Specification Sections
     st.subheader("Paint Specification Sections")
@@ -2850,7 +1648,7 @@ with tab_quote:
                     section["items"].pop(j)
                     st.rerun()
 
-            if st.button("➕ Add Item to Section", key=f"paint_add_item_{i}"):
+            if st.button("➕ Add Item to Section", key=f"add_item_{i}"):
                 section["items"].append(_default_paint_item())
                 st.rerun()
 
@@ -2875,7 +1673,7 @@ with tab_quote:
                 sec["item"] = st.selectbox(
                     "Additional Item",
                     options=_get_additional_item_order(),
-                    key=f"additional_item_{i}",
+                    key=f"add_item_{i}",
                 )
             if sec["item"] == "Water Procurement":
                 with col2:
@@ -2884,7 +1682,7 @@ with tab_quote:
                         value=float(sec.get("liters", 1000)),
                         min_value=0.0,
                         step=100.0,
-                        key=f"additional_liters_{i}",
+                        key=f"add_liters_{i}",
                     )
                 sec["duration_days"] = 0
                 sec["km"] = 0
@@ -2895,7 +1693,7 @@ with tab_quote:
                         value=sec.get("duration_days", 3),
                         min_value=0,
                         step=1,
-                        key=f"additional_dur_{i}",
+                        key=f"add_dur_{i}",
                     )
                 with col3:
                     sec["km"] = st.number_input(
@@ -2903,7 +1701,7 @@ with tab_quote:
                         value=sec.get("km", 80),
                         min_value=0,
                         step=10,
-                        key=f"additional_km_{i}",
+                        key=f"add_km_{i}",
                     )
             else:
                 with col2:
@@ -2912,7 +1710,7 @@ with tab_quote:
                         value=sec.get("duration_days", 1),
                         min_value=0,
                         step=1,
-                        key=f"additional_dur_{i}",
+                        key=f"add_dur_{i}",
                     )
                 sec["km"] = 0
             cost = _additional_section_cost(sec)
@@ -2936,16 +1734,15 @@ with tab_quote:
     with col4: st.metric("**Grand Total**", f"**R{grand_total:,.2f}**")
 
     # Export to Word
-    if st.button("📄 Export to Word – Exact same as index.html", type="primary", use_container_width=True, key="export_word_btn"):
+    if st.button("📄 Export to Word – Exact same as index.html", type="primary", width="stretch", key="export_word_btn"):
         try:
             from docxtpl import DocxTemplate
             import io, os
-            template_path = _resolve_template_path()
-            if not template_path:
-                st.error("❌ template.docx not found in the app folder!")
+            if not os.path.exists("template.docx"):
+                st.error("❌ template.docx not found!")
                 st.stop()
 
-            tpl = DocxTemplate(template_path)
+            tpl = DocxTemplate("template.docx")
 
             paint_specs = []
             for sec in _flatten_paint_sections(st.session_state.paint_sections):
@@ -2977,7 +1774,6 @@ with tab_quote:
             }
 
             tpl.render(context)
-            _docx_apply_quote_table_row_keep_together(tpl.docx)
             bio = io.BytesIO()
             tpl.save(bio)
             bio.seek(0)
@@ -2987,47 +1783,32 @@ with tab_quote:
                 data=bio.getvalue(),
                 file_name=_download_filename(job_no, client, "docx", tab_number=1),
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True
+                width="stretch"
             )
             st.success("✅ Quote exported successfully!")
         except Exception as e:
             st.error(f"Export error: {e}")
 
     # Email Quote as PDF
-    if st.button("📧 Email Quote to Client (as PDF)", type="secondary", use_container_width=True, key="email_quote_btn"):
+    if st.button("📧 Email Quote to Client (as PDF)", type="secondary", width="stretch", key="email_quote_btn"):
         try:
-            from docxtpl import DocxTemplate
-            import io, tempfile, os
-
-            if not WINDOWS_COM_AVAILABLE:
-                st.error("Emailing quote as PDF requires Microsoft Word on Windows.")
-                st.stop()
-
-            pythoncom.CoInitialize()
-
-            template_path = _resolve_template_path()
-            if not template_path:
-                st.error("❌ template.docx not found in the app folder!")
-                st.stop()
-
-            tpl = DocxTemplate(template_path)
-
             paint_specs = []
             for sec in _flatten_paint_sections(st.session_state.paint_sections):
-                if sec.get("area_m2", 0) <= 0: continue
+                if sec.get("area_m2", 0) <= 0:
+                    continue
                 mat, lab = calculate_section(sec)
                 unit = ITEM_UNITS.get(sec.get("item", ""), "m²")
                 paint_specs.append({
-                    "type": sec.get("type", ""), 
-                    "item": sec.get("item", ""), 
+                    "type": sec.get("type", ""),
+                    "item": sec.get("item", ""),
                     "method": sec.get("method", ""),
-                    "converted": str(int(sec.get("area_m2", 0))), 
+                    "converted": str(int(sec.get("area_m2", 0))),
                     "unit": unit,
                     "class": sec.get("paint_class", "A"),
                     "area_description": sec.get("area_description", ""),
                     "job_notes": sec.get("job_notes", ""),
-                    "materialcost": f"R{mat:,.2f}", 
-                    "labourcost": f"R{lab:,.2f}"
+                    "materialcost": f"R{mat:,.2f}",
+                    "labourcost": f"R{lab:,.2f}",
                 })
 
             additional_costs = [
@@ -3035,59 +1816,33 @@ with tab_quote:
             ]
 
             context = {
-                "clientname": client, 
+                "clientname": client,
                 "clientaddress": client_address,
-                "clientphone": client_phone, 
+                "clientphone": client_phone,
                 "clientemail": client_email,
-                "areaManagerName": area_manager, 
-                "areaManagerPhone": am_phone, 
+                "areaManagerName": area_manager,
+                "areaManagerPhone": am_phone,
                 "areaManagerEmail": am_email,
-                "quotedate": quote_date.strftime("%Y-%m-%d"), 
+                "quotedate": quote_date.strftime("%Y-%m-%d"),
                 "quotenumber": job_no,
-                "paint_specs": paint_specs, 
+                "paint_specs": paint_specs,
                 "additional_costs": additional_costs,
-                "materialtotal": f"R{total_material:,.2f}", 
+                "materialtotal": f"R{total_material:,.2f}",
                 "labourtotal": f"R{total_labour:,.2f}",
-                "additionaltotal": f"R{add_total:,.2f}", 
+                "additionaltotal": f"R{add_total:,.2f}",
                 "grandtotal": f"R{grand_total:,.2f}",
-                "grandtotal50": f"R{grand_total*0.5:,.2f}"
+                "grandtotal50": f"R{grand_total*0.5:,.2f}",
             }
 
-            tpl.render(context)
-            _docx_apply_quote_table_row_keep_together(tpl.docx)
-            docx_bio = io.BytesIO()
-            tpl.save(docx_bio)
-            docx_bio.seek(0)
-
-            with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp_docx:
-                tmp_docx.write(docx_bio.getvalue())
-                tmp_docx_path = tmp_docx.name
-
-            tmp_pdf_path = tmp_docx_path.replace(".docx", ".pdf")
-            _convert_docx_to_pdf(
-                tmp_docx_path,
-                tmp_pdf_path,
-                letterhead_first_page_only=True,
-                letterhead_path=_find_letterhead_docx_path(),
-            )
-
-            with open(tmp_pdf_path, "rb") as f:
-                pdf_bio = io.BytesIO(f.read())
-            pdf_bio.seek(0)
-
-            os.unlink(tmp_docx_path)
-            if os.path.exists(tmp_pdf_path):
-                os.unlink(tmp_pdf_path)
-
-            pythoncom.CoUninitialize()
+            pdf_bio = generate_quote_pdf(context)
 
             email_config = get_email_config()
             if not email_config:
-                st.error("❌ email_config.txt not found or incomplete.")
+                st.error("❌ SMTP not configured. Add email_config.txt or Streamlit secrets.")
                 st.stop()
 
-            client_email = client_email.strip()
-            if not client_email:
+            client_email_addr = client_email.strip()
+            if not client_email_addr:
                 st.error("Please enter the client's email address first.")
                 st.stop()
 
@@ -3106,7 +1861,7 @@ Pro Paint Teams"""
             filename = _download_filename(job_no, client, "pdf", tab_number=1)
 
             success, message = send_quote_email(
-                client_email, subject, body, pdf_bio, filename, email_config
+                client_email_addr, subject, body, pdf_bio, filename, email_config
             )
 
             if success:
@@ -3114,31 +1869,19 @@ Pro Paint Teams"""
             else:
                 st.error(message)
 
-        except ImportError as e:
-            st.error(f"❌ Missing package for email export: {e}")
         except Exception as e:
-            st.error(
-                f"PDF conversion / Email error: {e}\n\n"
-                "Tips: close any stuck Word windows, ensure Microsoft Word is installed, "
-                "then try again."
-            )
-        finally:
-            try:
-                pythoncom.CoUninitialize()
-            except:
-                pass
+            st.error(f"PDF / Email error: {e}")
 
     # Save to Database
     st.divider()
     if DB_READY:
-        if st.button("💾 Save Quote & Client to Cloud Database", type="primary", use_container_width=True, key="save_quote_btn"):
+        if st.button("💾 Save Quote & Client to Cloud Database", type="primary", width="stretch", key="save_quote_btn"):
             try:
-                db_local.save_client(client, client_phone, client_email, client_address)
-                db_local.save_job(job_no=job_no, job_name=client, client=client,
+                db_sheets.save_client(client, client_phone, client_email, client_address)
+                db_sheets.save_job(job_no=job_no, job_name=client, client=client,
                                    area_manager=area_manager, team_leader="", start_date=quote_date,
-                                   total_labour=total_labour,
-                                   man_days_available=(total_labour / 2) / 350 if total_labour > 0 else 0.0)
-                _clear_db_cache()
+                                   total_labour=total_labour, man_days_available=0)
+                _clear_cloud_cache()
                 st.success(f"✅ Quote **{job_no}** saved!")
             except Exception as e:
                 st.error(f"Save error: {e}")
@@ -3148,7 +1891,8 @@ Pro Paint Teams"""
     st.session_state.total_labour = total_labour
     st.session_state.additional_total = add_total
     st.session_state.grand_total = grand_total
-    st.session_state.man_days_available = (total_labour / 2) / 350 if total_labour > 0 else 0.0
+    st.session_state.man_days_available = total_labour / 350 if total_labour > 0 else 0.0
+    st.session_state.paint_sections_for_tab2 = st.session_state.paint_sections.copy()
     if "tab1_data" not in st.session_state:
         st.session_state.tab1_data = {}
     _snap = _tab1_snapshot_id(
@@ -3161,7 +1905,7 @@ Pro Paint Teams"""
         "client_address": client_address, "area_manager": area_manager, "am_phone": am_phone, "am_email": am_email,
         "quote_date": quote_date, "total_material": total_material, "total_labour": total_labour,
         "additional_total": add_total, "grand_total": grand_total,
-        "man_days_available": (total_labour / 2) / 350 if total_labour > 0 else 0.0,
+        "man_days_available": total_labour / 350 if total_labour > 0 else 0.0,
         "paint_sections": st.session_state.paint_sections.copy(),
         "additional_sections": st.session_state.additional_sections.copy(),
         "snapshot_id": _snap,
@@ -3185,7 +1929,7 @@ with tab2:
     # Top client info (matches app display)
     st.markdown(f"""
     <div style="text-align:right;"><b>Job Number:</b> <code>{job_no}</code></div>
-    <div><b>Client:</b> {client}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>Phone:</b> {client_phone}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>Email:</b> {client_email}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>Address:</b> {client_address}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>Area Manager:</b> {area_manager}</div>
+    <div><b>Client:</b> {client}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>Phone:</b> {client_phone}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>Email:<b></b> {client_email}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>Address:</b> {client_address}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>Area Manager:</b> {area_manager}</div>
     """, unsafe_allow_html=True)
     st.caption("All information pulled live from Tab 1 Quote Breakdown")
 
@@ -3223,7 +1967,7 @@ with tab2:
                 item_rates = st.session_state.get("ITEM_RATES", {}).get(item, {'labour': 47})
                 base_labour = item_rates.get('labour', 47) * mult
                 labour_total = area * base_labour
-                man_days = round((labour_total / 2) / 350, 2) if labour_total > 0 else 0.0
+                man_days = round(labour_total / 350, 2) if labour_total > 0 else 0.0
                 man_days_list.append(man_days)
 
             df["MD /Section"] = man_days_list
@@ -3276,7 +2020,7 @@ with tab2:
         st.session_state.tab2_editor_df = st.data_editor(
             st.session_state.tab2_editor_df,
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_order=(
                 "Section",
@@ -3314,7 +2058,7 @@ with tab2:
     spec_sections = _tab2_job_spec_sections(paint_sections, edited_spec)
 
     # ONE SINGLE PDF DOWNLOAD BUTTON (PDF only - no extra steps)
-    if st.button("📄 Download Job Spec PDF (with Letterhead)", type="primary", use_container_width=True):
+    if st.button("📄 Download Job Spec PDF (with Letterhead)", type="primary", width="stretch"):
         pdf_buffer = generate_letterhead_pdf(
             tab_title="Job Spec & Site Man-Days",
             job_no=job_no,
@@ -3337,7 +2081,7 @@ with tab2:
                 data=pdf_buffer.getvalue(),
                 file_name=_download_filename(job_no, client, "pdf", tab_number=2),
                 mime="application/pdf",
-                use_container_width=True
+                width="stretch"
             )
 
 # ====================== TAB 3: ATTENDANCE & BONUS ======================
@@ -3408,7 +2152,7 @@ with tab3:
         edited_df = st.data_editor(
             st.session_state.attendance_df,
             num_rows="fixed",
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "Name": st.column_config.TextColumn("Name:", width="medium"),
@@ -3471,7 +2215,7 @@ with tab3:
         st.metric("Bonus per Man Day", f"R {bonus_per_man_day:,.2f}")
 
     # ==================== PDF DOWNLOAD ====================
-    if st.button("📄 Generate Attendance PDF", type="primary", use_container_width=True):
+    if st.button("📄 Generate Attendance PDF", type="primary", width="stretch"):
         att_df = st.session_state.attendance_df
         table_data = [
             ["Date"] + [""] * 31 + ["", ""],
@@ -3507,8 +2251,10 @@ with tab3:
                 "attendance_template.docx",
                 "Attendance_template.docx",
                 "ATTENDANCE_TEMPLATE.docx",
-                "Letterhead.docx",
+                "template.docx",
+                "Template.docx",
                 "letterhead.docx",
+                "Letterhead.docx",
             ],
         )
 
@@ -3522,7 +2268,7 @@ with tab3:
             data=st.session_state["attendance_pdf_bytes"],
             file_name=_download_filename(job_no, client, "pdf", tab_number=3),
             mime="application/pdf",
-            use_container_width=True
+            width="stretch"
         )
 # ====================== TAB 4: EMPLOYMENT CONTRACT ======================
 with tab4:
@@ -3595,7 +2341,7 @@ Signed (Manager):  ____________________________  Date: ____________
                 data.get("job_no", ""), data.get("client", ""), "pdf", tab_number=4
             ),
             mime="application/pdf",
-            use_container_width=True,
+            width="stretch",
             type="primary"
         )
 
@@ -3618,26 +2364,16 @@ with tab5:
     if not paint_sections or not has_line_items:
         st.warning("Add at least one paint section with a quantity greater than zero on Tab 1.")
     else:
-        dash_rows_data = []
-        for sec in flat_paint_sections:
-            area = float(sec.get("area_m2", 0) or 0)
-            if area <= 0:
-                continue
-            cls = sec.get("paint_class", "A")
-            item = sec.get("item", "Walls")
-            mult = {"A": 1.0, "B": 1.15, "C": 1.25}.get(cls, 1.0)
-            item_rates = st.session_state.get("ITEM_RATES", {}).get(item, {"labour": 47})
-            labour_total = area * item_rates.get("labour", 47) * mult
-            man_days = round((labour_total / 2) / 350, 2) if labour_total > 0 else 0.0
-            dash_rows_data.append({
-                "Quote Area": item,
-                "Quantity": area,
-                "Allowed Man-Days": man_days,
-            })
-        df_spec_dash = pd.DataFrame(dash_rows_data)
+        df_spec_dash = pd.DataFrame([
+            {
+                "Quote Area": sec.get("item", "Unknown"),
+                "Quantity": float(sec.get("area_m2", 0)),
+                "Allowed Man-Days": (float(sec.get("area_m2", 0)) / 30)
+            } for sec in flat_paint_sections if float(sec.get("area_m2", 0)) > 0
+        ])
 
         d1, d2, d3 = st.columns(3)
-        with d1: st.metric("Man-days (Tab 1 labour ÷ 2 ÷ 350)", f"{man_days_available:.2f}")
+        with d1: st.metric("Man-days (Tab 1 labour ÷ 350)", f"{man_days_available:.2f}")
         with d2:
             total_qty = df_spec_dash["Quantity"].sum()
             st.metric("Total quoted quantity (sum of units)", f"{total_qty:,.0f}")
@@ -3646,14 +2382,14 @@ with tab5:
         if not df_spec_dash.empty:
             fig_bar = px.bar(df_spec_dash, x="Quote Area", y="Allowed Man-Days", title="Allowed Man-Days per Area", color="Allowed Man-Days", color_continuous_scale="Blues")
             fig_bar.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig_bar, use_container_width=True, key="dash_bar_chart")
+            st.plotly_chart(fig_bar, width="stretch", key="dash_bar_chart")
 
             fig_pie = px.pie(df_spec_dash, names="Quote Area", values="Allowed Man-Days", title="Man-Day Distribution by Area")
-            st.plotly_chart(fig_pie, use_container_width=True, key="dash_pie_chart")
+            st.plotly_chart(fig_pie, width="stretch", key="dash_pie_chart")
 
             fig_qty = px.bar(df_spec_dash, x="Quote Area", y="Quantity", title="Quantity per Area", color="Quote Area")
             fig_qty.update_layout(xaxis_tickangle=-45, showlegend=False)
-            st.plotly_chart(fig_qty, use_container_width=True, key="dash_qty_chart")
+            st.plotly_chart(fig_qty, width="stretch", key="dash_qty_chart")
 
         dash_rows = [["Quote Area", "Quantity", "Allowed Man-Days"]]
         for _, r in df_spec_dash.iterrows():
@@ -3679,6 +2415,259 @@ with tab5:
                     data.get("job_no", ""), data.get("client", ""), "pdf", extra_suffix="Dashboard"
                 ),
                 mime="application/pdf",
-                use_container_width=True,
+                width="stretch",
                 type="primary"
             )
+
+# ====================== TAB 6: QUOTES ======================
+with tab6:
+    _t6_hdr, _t6_btn, _t6_spacer = st.columns([3, 1, 6])
+    with _t6_hdr:
+        st.subheader("Saved Quotes")
+    with _t6_btn:
+        st.write("")  # vertical alignment spacer
+        if st.button("🔄 Refetch", key="quotes_refetch_btn",
+                     type="secondary", use_container_width=True):
+            _cached_job_history.clear()
+            st.rerun()
+
+    if not DB_READY:
+        st.warning("Google Sheets is not configured, so saved quotes cannot be loaded.")
+    else:
+        try:
+            quotes_df = _cached_job_history()
+        except Exception as e:
+            st.error(f"Could not load saved quotes: {e}")
+            quotes_df = pd.DataFrame()
+
+        if quotes_df.empty:
+            st.info("No saved quotes found yet. Save a quote on Tab 1 to see it here.")
+        else:
+            display_df = quotes_df.copy()
+
+            if "job_no" in display_df.columns:
+                display_df["Quote #"] = display_df["job_no"].astype(str)
+            else:
+                display_df["Quote #"] = ""
+
+            if "date_created" in display_df.columns:
+                display_df["Saved At"] = pd.to_datetime(
+                    display_df["date_created"], errors="coerce"
+                ).dt.strftime("%Y-%m-%d %H:%M")
+                display_df["Saved At"] = display_df["Saved At"].fillna("")
+            else:
+                display_df["Saved At"] = ""
+
+            if "total_labour" in display_df.columns:
+                display_df["Labour Total"] = pd.to_numeric(
+                    display_df["total_labour"], errors="coerce"
+                ).fillna(0.0)
+            else:
+                display_df["Labour Total"] = 0.0
+
+            if "man_days_available" in display_df.columns:
+                display_df["Man-Days"] = pd.to_numeric(
+                    display_df["man_days_available"], errors="coerce"
+                ).fillna(0.0)
+            else:
+                display_df["Man-Days"] = 0.0
+
+            if "start_date" in display_df.columns:
+                display_df["Quote Date"] = pd.to_datetime(
+                    display_df["start_date"], errors="coerce"
+                ).dt.strftime("%Y-%m-%d")
+                display_df["Quote Date"] = display_df["Quote Date"].fillna("")
+            else:
+                display_df["Quote Date"] = ""
+
+            for col in ["client", "phone", "email", "address", "area_manager", "status"]:
+                if col not in display_df.columns:
+                    display_df[col] = ""
+
+
+            # ---------- Filters ----------
+            f1, f2, f3 = st.columns(3)
+            with f1:
+                search_text = st.text_input(
+                    "Search (Quote # / Client / Email)",
+                    value="",
+                    key="quotes_search_text",
+                    placeholder="Type quote number, client, or email",
+                ).strip()
+            with f2:
+                status_options = ["All"] + sorted(
+                    [s for s in display_df["status"].astype(str).fillna("").unique().tolist() if s]
+                )
+                status_filter = st.selectbox(
+                    "Status filter",
+                    options=status_options if status_options else ["All"],
+                    index=0,
+                    key="quotes_status_filter",
+                )
+            with f3:
+                client_list = sorted(
+                    [c for c in display_df["client"].astype(str).fillna("").unique().tolist() if c]
+                )
+                client_filter = st.selectbox(
+                    "Client filter",
+                    options=["All"] + client_list,
+                    index=0,
+                    key="quotes_client_filter",
+                )
+
+            filtered_df = display_df.copy()
+            if search_text:
+                query = search_text.lower()
+                search_mask = (
+                    filtered_df["Quote #"].astype(str).str.lower().str.contains(query, na=False)
+                    | filtered_df["client"].astype(str).str.lower().str.contains(query, na=False)
+                    | filtered_df["email"].astype(str).str.lower().str.contains(query, na=False)
+                )
+                filtered_df = filtered_df[search_mask]
+            if status_filter != "All":
+                filtered_df = filtered_df[
+                    filtered_df["status"].astype(str).str.lower()
+                    == str(status_filter).strip().lower()
+                ]
+            if client_filter != "All":
+                filtered_df = filtered_df[
+                    filtered_df["client"].astype(str).str.lower()
+                    == str(client_filter).strip().lower()
+                ]
+
+            table_df = filtered_df[
+                [
+                    "Quote #",
+                    "client",
+                    "phone",
+                    "email",
+                    "address",
+                    "area_manager",
+                    "Quote Date",
+                    "Labour Total",
+                    "Man-Days",
+                    "status",
+                    "Saved At",
+                ]
+            ].rename(
+                columns={
+                    "client": "Client",
+                    "phone": "Phone",
+                    "email": "Email",
+                    "address": "Address",
+                    "area_manager": "Area Manager",
+                    "status": "Status",
+                }
+            )
+
+            table_df = table_df.sort_values(
+                by=["Saved At", "Quote #"], ascending=[False, False], na_position="last"
+            ).reset_index(drop=True)
+            table_df.insert(0, "Row", range(1, len(table_df) + 1))
+            table_df["Labour Total"] = table_df["Labour Total"].map(lambda x: f"R{x:,.2f}")
+            table_df["Man-Days"] = table_df["Man-Days"].map(lambda x: f"{x:.2f}")
+
+            csv_df = display_df.copy()
+            csv_df = csv_df.sort_values(
+                by=["Saved At", "Quote #"], ascending=[False, False], na_position="last"
+            ).reset_index(drop=True)
+            csv_export_df = csv_df[
+                [
+                    "Quote #",
+                    "client",
+                    "phone",
+                    "email",
+                    "address",
+                    "area_manager",
+                    "Quote Date",
+                    "total_labour",
+                    "man_days_available",
+                    "status",
+                    "Saved At",
+                ]
+            ].rename(
+                columns={
+                    "client": "Client",
+                    "phone": "Phone",
+                    "email": "Email",
+                    "address": "Address",
+                    "area_manager": "Area Manager",
+                    "total_labour": "Labour Total",
+                    "man_days_available": "Man-Days",
+                    "status": "Status",
+                }
+            )
+            st.download_button(
+                "⬇️ Export All Quotes (CSV)",
+                data=csv_export_df.to_csv(index=False).encode("utf-8"),
+                file_name="saved_quotes_all.csv",
+                mime="text/csv",
+                type="secondary",
+                width="content",
+            )
+
+            total_rows = len(table_df)
+            c1, c2, c3 = st.columns([1, 1, 2])
+            with c1:
+                page_size = int(
+                    st.selectbox(
+                        "Rows per page",
+                        options=[10, 20, 50, 100],
+                        index=1,
+                        key="quotes_page_size",
+                    )
+                )
+            total_pages = max(1, (total_rows + page_size - 1) // page_size)
+            with c2:
+                page = int(
+                    st.number_input(
+                        "Page",
+                        min_value=1,
+                        max_value=total_pages,
+                        value=1,
+                        step=1,
+                        key="quotes_page_number",
+                    )
+                )
+            with c3:
+                st.caption(f"Showing page {page} of {total_pages} ({total_rows} saved quotes)")
+
+            start_idx = (page - 1) * page_size
+            end_idx = start_idx + page_size
+            page_df = table_df.iloc[start_idx:end_idx].copy()
+
+            col_widths = [0.4, 1.0, 1.6, 1.2, 1.1, 1.1, 0.9, 1.1]
+            header_cols = st.columns(col_widths)
+            header_cols[0].markdown("**Row**")
+            header_cols[1].markdown("**Quote #**")
+            header_cols[2].markdown("**Client**")
+            header_cols[3].markdown("**Quote Date**")
+            header_cols[4].markdown("**Labour Total**")
+            header_cols[5].markdown("**Man-Days**")
+            header_cols[6].markdown("**Status**")
+            header_cols[7].markdown("**Details/Edit**")
+
+            for i, row in page_df.iterrows():
+                row_cols = st.columns(col_widths)
+                row_cols[0].write(int(row.get("Row", 0)))
+                row_cols[1].write(str(row.get("Quote #", "")))
+                row_cols[2].write(str(row.get("Client", "")))
+                row_cols[3].write(str(row.get("Quote Date", "")))
+                row_cols[4].write(str(row.get("Labour Total", "")))
+                row_cols[5].write(str(row.get("Man-Days", "")))
+                row_cols[6].write(str(row.get("Status", "")))
+
+                quote_no = str(row.get("Quote #", "") or "")
+                if quote_no:
+                    _tab6_token = _create_auth_token(quote_no)
+                    _tab6_url = f"?auth_token={_url_quote(_tab6_token, safe='')}"
+                    row_cols[7].markdown(
+                        f'<a href="{_tab6_url}" target="_blank" rel="noopener noreferrer"'
+                        f' style="display:inline-block;width:100%;text-align:center;'
+                        f'padding:0.35rem 0.5rem;border-radius:0.35rem;'
+                        f'border:1px solid rgba(49,51,63,0.2);'
+                        f'color:inherit;font-size:0.875rem;'
+                        f'text-decoration:none;white-space:nowrap;">'
+                        f"Details/Edit</a>",
+                        unsafe_allow_html=True,
+                    )
