@@ -19,6 +19,8 @@ T = TypeVar("T")
 
 _sp_cache = None
 _worksheets_verified = False
+_connection_verified: bool | None = None
+_connection_error: str | None = None
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -111,19 +113,56 @@ def _load_credentials() -> Credentials | None:
     return None
 
 
+def _auth_failure_message(creds: Credentials, exc: Exception) -> str:
+    email = getattr(creds, "service_account_email", "unknown")
+    return (
+        f"Google authentication failed for service account {email}. "
+        "Google reported that this account does not exist or its key was revoked. "
+        "In Google Cloud Console → IAM & Admin → Service Accounts, confirm the account "
+        "still exists, create a new JSON key if needed, then update credentials.json "
+        "and Streamlit secrets with the new file."
+    )
+
+
 def _verify_credentials(creds: Credentials) -> None:
     """Refresh the token early so auth problems surface with a clear message."""
     try:
         creds.refresh(Request())
     except RefreshError as exc:
-        email = getattr(creds, "service_account_email", "unknown")
+        raise RuntimeError(_auth_failure_message(creds, exc)) from exc
+    except Exception as exc:
         raise RuntimeError(
-            f"Google authentication failed for service account {email}. "
-            "Google reported that this account does not exist or its key was revoked. "
-            "In Google Cloud Console → IAM & Admin → Service Accounts, confirm the account "
-            "still exists, create a new JSON key if needed, then update credentials.json "
-            "and Streamlit secrets with the new file."
+            f"Google authentication failed for service account "
+            f"{getattr(creds, 'service_account_email', 'unknown')}: {exc}"
         ) from exc
+
+
+def get_connection_error() -> str | None:
+    return _connection_error
+
+
+def _verify_connection() -> bool:
+    """Check credentials exist and can authenticate (cached per process)."""
+    global _connection_verified, _connection_error
+
+    if _connection_verified is not None:
+        return _connection_verified
+
+    creds = _load_credentials()
+    sheet_id = _get_spreadsheet_id()
+    if not creds or not sheet_id:
+        _connection_verified = False
+        return False
+
+    try:
+        _verify_credentials(creds)
+    except RuntimeError as exc:
+        _connection_error = str(exc)
+        _connection_verified = False
+        return False
+
+    _connection_verified = True
+    return True
 
 
 def _get_spreadsheet_id() -> str | None:
@@ -144,7 +183,7 @@ def _get_spreadsheet_id() -> str | None:
 
 
 def is_configured() -> bool:
-    return bool(_load_credentials() and _get_spreadsheet_id())
+    return _verify_connection()
 
 
 def get_service_account_email() -> str:
@@ -160,9 +199,11 @@ def save_spreadsheet_id(sheet_id: str) -> None:
 
 
 def _reset_connection_cache() -> None:
-    global _sp_cache, _worksheets_verified
+    global _sp_cache, _worksheets_verified, _connection_verified, _connection_error
     _sp_cache = None
     _worksheets_verified = False
+    _connection_verified = None
+    _connection_error = None
 
 
 def _retry_on_quota(func: Callable[..., T], *args, **kwargs) -> T:
@@ -189,7 +230,13 @@ def connect():
         raise RuntimeError(
             "Google credentials not found. Add credentials.json or Streamlit secrets."
         )
-    _verify_credentials(creds)
+    try:
+        _verify_credentials(creds)
+    except RuntimeError as exc:
+        global _connection_error, _connection_verified
+        _connection_error = str(exc)
+        _connection_verified = False
+        raise
     sheet_id = _get_spreadsheet_id()
     if not sheet_id:
         raise RuntimeError(
@@ -216,11 +263,14 @@ def _worksheet(name: str):
 
 
 def _read_dataframe(name: str) -> pd.DataFrame:
-    if not is_configured():
-        return pd.DataFrame(columns=SHEET_HEADERS[name])
-    ws = _worksheet(name)
-    records = _retry_on_quota(ws.get_all_records)
     headers = SHEET_HEADERS[name]
+    if not is_configured():
+        return pd.DataFrame(columns=headers)
+    try:
+        ws = _worksheet(name)
+        records = _retry_on_quota(ws.get_all_records)
+    except RuntimeError:
+        return pd.DataFrame(columns=headers)
     if not records:
         return pd.DataFrame(columns=headers)
     return pd.DataFrame(records)

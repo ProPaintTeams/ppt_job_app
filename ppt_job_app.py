@@ -168,15 +168,20 @@ _require_app_password()
 _standalone_quote = st.session_state.get("_standalone_quote", "")
 if _standalone_quote:
     _sa_db_ready = False
+    _sa_conn_err = None
     try:
         _sa_db_ready = db_sheets.is_configured()
+        _sa_conn_err = db_sheets.get_connection_error()
     except Exception:
         pass
 
     if not _sa_db_ready:
         st.title(f"Quote Details — {_standalone_quote}")
         st.caption("Pro Paint Teams · authenticated session")
-        st.error("Database not configured — cannot load quote details.")
+        if _sa_conn_err:
+            st.error(_sa_conn_err)
+        else:
+            st.error("Database not configured — cannot load quote details.")
     else:
         try:
             _sa_history = db_sheets.get_job_history()
@@ -417,7 +422,10 @@ try:
     DB_READY = db_sheets.is_configured()
 except Exception:
     DB_READY = False
-if not DB_READY:
+_conn_err = db_sheets.get_connection_error()
+if _conn_err:
+    st.error(_conn_err)
+elif not DB_READY:
     st.warning(
         "Google Sheets not configured — cloud save disabled. "
         "Run setup_sheets.py locally or add secrets on Streamlit Cloud."
@@ -718,71 +726,267 @@ _MASTER_RATES_EDITOR_KEY = "master_rates_editor"
 
 
 # Default master rates when nothing is saved in the database yet
-DEFAULT_MASTER_RATES = [
-    {"Item": "Aluminium Restore", "Unit": "each", "Material (R/unit)": 11, "Labour (R/unit)": 35,
-     "Default Job Notes": "•	Remove all loose contaminents with a soft bristle brush\n•	Spray Aluminium Cleaner, let soak for 5 to 10min and wipe off\n•	Apply Alu Revivie to a soft fibre cloth and apply in circular motion till dry\n•	Add coates of Alu revive till desired finish is achieved"},
-    {"Item": "Ceiling/Soffits", "Unit": "m²", "Material (R/unit)": 47, "Labour (R/unit)": 55,
-     "Default Job Notes": "•	Wash ceilings where necessary.\n•	Remove all dust, cobwebs or loose contamination with soft bristle brush.\n•	Caulk ceilings to cornice or wall.\n•	For skimmed ceilings, prime with Midas Plaster Primer.\n•	Apply 2coats of Midafelt 225 (colour to be specified)"},
-    {"Item": "Cornices", "Unit": "lm", "Material (R/unit)": 35, "Labour (R/unit)": 35,
-     "Default Job Notes": "•	Remove loose contaminents and wash with Midas Degreaser where neccesary\n•	Allow to fully dry, then sand lightly to remove gloss and get a uniform finish.\n•	Caulk cornice where neccesary\n•	Apply 1 coat of Universal Undercoat\n•	Allow 4 hours for overcoating\n•	Apply 2 coats of Midafelt 225 OR 2 coats of Waterbased Non-drip Enamel (colour to be specified)"},
-    {"Item": "Crack Repairs", "Unit": "m²", "Material (R/unit)": 30, "Labour (R/unit)": 45,
-     "Default Job Notes": "•	Rake out all cracks wider than 0.5mm (not hairline cracks)\n•	Prime with waterproofing slurry kit OR PCT36\n•	Build up cracks with REPAIR MIX\n•	Smoothen or use a sponge to match existing texture\n•	Open all expansion joints and seal with All Round Sealer"},
-    {"Item": "Cup Grind- Floor Prep", "Unit": "m²", "Material (R/unit)": 30, "Labour (R/unit)": 45,
-     "Default Job Notes": "Note to Client: Cup grinding is a noisy and dusty process. We recommend to remove all items from the room. We aim to complete the work in the prescribed time.\n•	Throuogly sweep floor to remove loose conatminents.\n•	Vaccuum floor to remove all dust and finer contaminents.\n•	Pass the cup-grinder once over the area to achieve a level uniform top.\n•	The objective is to remove the top layer of concrete to create a key coat for the following steps."},
-    {"Item": "Cup Grind- To finish with clear sealer", "Unit": "m²", "Material (R/unit)": 75, "Labour (R/unit)": 90,
-     "Default Job Notes": "Note to Client: Cup grinding is a noisy and dusty process. We recommend to remove all items from the room. We aim to complete the work in the prescribed time.\n•	Throuogly sweep floor to remove loose conatminents.\n•	Vaccuum floor to remove all dust and finer contaminents.\n•	Pass the cup-grinder once over the area to remove high spots\n•	Sweep and vacuum floor to remove all dust\n•	Using a straight edge, look for high spots and mark with chalk\n•	Pass over with the cup-grinder for a second time to cut a smooth uniform finish. \n•	The objective is to grind down the top to a smooth, flat surface, which can be cleaned and sealed."},
-    {"Item": "Exterior Walls Paintwork", "Unit": "m²", "Material (R/unit)": 35, "Labour (R/unit)": 35,
-     "Default Job Notes": "•	Preperation work quoted separately\n•	Remove all loose contaminents and let dry after Pressure Wash.\n•	Allow any repair work to fully dry\n•	Sand lightly and remove dust\n•	Spot prime repairs with Masonry Primer. On new build Prime entire wall with Masonry Primer\n•	Apply 2 coats of Midalux 240 (colour to be specified)"},
-    {"Item": "Facias/Gutters", "Unit": "lm", "Material (R/unit)": 30, "Labour (R/unit)": 25,
-     "Default Job Notes": "•	Ensure surfaces are clean inside and out.\n•	Seal leaks and joints using All Round Sealer, use Peel and Seel for larger gaps\n•	Apply 1 coat of Universal Primer\n•	Apply 2 coats of Midalux 240 (colour to be secified)"},
-    {"Item": "High Pressure Washing", "Unit": "each", "Material (R/unit)": 980, "Labour (R/unit)": 700,
-     "Default Job Notes": "NOTE TO CLIENT: This is a noisy process and can be messy. This should not take more than the indicted days and will be cleaned up. Please point out water sources to be used to the Team Leader upon commencment of work.\n•	High pressure wash min pressure 200 bar  \n•	Wash to remove all salt and dirt + Loose material from area. \n•	When working on the roof use safety harness and anchor point for safety. \n•	Use drop sheet and garbage bags to collect all loose material generated. \n•	Perform cleanup of the area before commencing to with next step"},
-    {"Item": "Interior Skimming", "Unit": "m²", "Material (R/unit)": 75, "Labour (R/unit)": 90,
-     "Default Job Notes": "•	Complete repairs first\n•	Allow fillers and repairs to dry\n•	Use a steel trowel and Interior Skimfill to achieve smooth uniform surface\n•	Sand lightly and wipe down before continuing to prime and paint"},
-    {"Item": "Interior Walls Paintwork", "Unit": "m²", "Material (R/unit)": 35, "Labour (R/unit)": 35,
-     "Default Job Notes": "•	If not skimmed/repaired wash walls with Sugar Soap where contaminated\n•	Let repairs/wash completely dry\n•	Sand repairs and spot prime with Plaster Primer. On new builds prime entire wall with Plaster Primer\n•	Apply two coats of Midafelt 230 (Colour to be specified)"},
-    {"Item": "Mould and Fungi Treatment", "Unit": "m²", "Material (R/unit)": 12, "Labour (R/unit)": 35,
-     "Default Job Notes": "•	Apply 1 coat Midas FUNGICIDAL WASH to all affected areas.\n•	Allow minimum 24 hours reaction time.\n•	Remove all growth with a stiff fibre brush.\n•	Apply SECOND coat of FUNGICIDAL WASH.\n•	DO NOT rinse off the second coat.\n•	Failure to follow this sequence risks regrowth."},
-    {"Item": "Paint Galvanised Metal", "Unit": "m²", "Material (R/unit)": 125, "Labour (R/unit)": 45,
-     "Default Job Notes": "•	Lightly sand surface to dull uniform appearance\n•	Apply 1 coat of 504 Surface Tolerant Epoxy as Primer\n•	Allow 6 to 12 hours (weather depending) to dry before overcoating\n•	Apply 1 coat of 504 Surface Tolerant Epoxy\n•	Allow to Allow 6 to 12 hours (weather depending) to dry before overcoating\n•	Apply 2 coats of 112 Solvent Based Acrithane Sealer"},
-    {"Item": "Paint Metal", "Unit": "m²", "Material (R/unit)": 75, "Labour (R/unit)": 55,
-     "Default Job Notes": "•	Clean metal with Midas Degreaser\n•	Lighlty sand metal to dull uniform surface\n•	Add caulk to frame and wall gaps\n•	Apply 1 coat Metaletch Primer\n•	Apply 1 coat Midaflow Gloss or Midas Masterroof (colour to be specified)"},
-    {"Item": "Paint Metal- Windows/Doors", "Unit": "each", "Material (R/unit)": 185, "Labour (R/unit)": 275,
-     "Default Job Notes": "•	Clean metal with Midas Degreaser\n•	Lighlty sand metal to dull uniform surface\n•	Add caulk to frame and wall gaps\n•	Apply 1 coat Metaletch Primer\n•	Apply 1 coat Midaflow Gloss or Midas Masterroof (colour to be specified)"},
-    {"Item": "Paint Wood", "Unit": "m²", "Material (R/unit)": 60, "Labour (R/unit)": 45,
-     "Default Job Notes": "•	If bare/ new wood present, apply Midas Woodprime to all new surfaces\n•	Lightly sand to uniform colour/appearance\n•	Add caulk to frame and wall gaps\n•	Replace cracking/dry or missing putty. Use Putty Hardener\n•	Spot prime nails, screws or metal fittings with Metal Etch Primer\n•	Apply 1 coat of Universal Undercoat\n•	Apply 2 coat of Midalux 240 OR 2 coats of Water Based Non-Drip Enamel (colour to be specified)"},
-    {"Item": "Paint Wood- Windows/Doors", "Unit": "each", "Material (R/unit)": 150, "Labour (R/unit)": 225,
-     "Default Job Notes": "•	If bare/ new wood present, apply Midas Woodprime to all new surfaces\n•	Lightly sand to uniform colour/appearance\n•	Add caulk to frame and wall gaps\n•	Replace cracking/dry or missing putty. Use Putty Hardener\n•	Spot prime nails, screws or metal fittings with Metal Etch Primer\n•	Apply 1 coat of Universal Undercoat\n•	Apply 2 coat of Midalux 240 OR 2 coats of Midaflow (ext) WB Non-Drip (int) (colour to be specified)"},
-    {"Item": "Plaster Repair", "Unit": "m²", "Material (R/unit)": 80, "Labour (R/unit)": 50,
-     "Default Job Notes": "•	Remove ALL loose, defective and damaged plaster\n•	Prime area with 1 coat bonding liquid\n•	Repair with Paintsmiths PLASTER REPAIR KIT\n•	Do not exceed 20mm thickness.\n•	Do not rush curing – insufficient curing leads to failure\n•	Wet plaster 2 times daily or cover with dropsheet after first wetting.\n•	Smoothen plaster or use a sponge to match existing texture."},
-    {"Item": "Roof Painting", "Unit": "m²", "Material (R/unit)": 55, "Labour (R/unit)": 65,
-     "Default Job Notes": "•	Ensure roof is dry and clean. Do not paint in high humidity, temperature or probability of mist/rain.\n•	Spot prime nails, roof screws and metal fittings with Rust Neutrelizer and Metal Etch Primer.\n•	If needed apply 1 coat of Primer\n•	Apply 2 coats of Midas Masteroof OR Rubberduck (colour to be specified)"},
-    {"Item": "Skimming", "Unit": "m²", "Material (R/unit)": 75, "Labour (R/unit)": 90,
-     "Default Job Notes": "•	Complete repairs first\n•	Allow fillers and repairs to dry\n•	Use a steel trowel and Exterior OR Interior Skimfill to achieve smooth uniform surface\n•	Sand lightly and wipe down before continuing to prime and paint"},
-    {"Item": "Skirtings", "Unit": "lm", "Material (R/unit)": 45, "Labour (R/unit)": 35,
-     "Default Job Notes": "•	Remove loose contaminents and wash with Midas Degreaser where neccesary\n•	Allow to fully dry, then sand lightly to remove gloss and get a uniform finish.\n•	Caulk skirting where neccesary\n•	Apply 1 coat of Universal Undercoat\n•	Allow 4 hours for overcoating\n•	Apply 2 coats of Midafelt 225 OR 2 coats of Waterbased Non-drip Enamel (colour to be specified)"},
-    {"Item": "Tile Remove", "Unit": "m²", "Material (R/unit)": 750, "Labour (R/unit)": 350,
-     "Default Job Notes": "•	Skip Rental\n•	Work following tile removal is a provisional part of the quote- Dependant on substrate condition the quote will have to be reassessed."},
-    {"Item": "Timber Preserve", "Unit": "m²", "Material (R/unit)": 70, "Labour (R/unit)": 45,
-     "Default Job Notes": "•	Lightly sand to uniform colour/appearance\n•	Add caulk to frame and wall gaps\n•	Replace cracking/dry or missing putty. Use Putty Hardener\n•	Apply 1 coat of Timber Preserve**\n•	Lighlty sand and apply second coat of Timber Preserve**\n**Please note drying time is 48hrs +"},
-    {"Item": "Timber Preserve- Windows/Doors", "Unit": "each", "Material (R/unit)": 125, "Labour (R/unit)": 175,
-     "Default Job Notes": "•	Lightly sand to uniform colour/appearance\n•	Add caulk to frame and wall gaps\n•	Replace cracking/dry or missing putty. Use Putty Hardener\n•	Apply 1 coat of Timber Preserve**\n•	Lighlty sand and apply second coat of Timber Preserve**\n**Please note drying time is 48hrs +"},
-    {"Item": "Varnish Wood", "Unit": "m²", "Material (R/unit)": 51, "Labour (R/unit)": 97,
-     "Default Job Notes": "•	Lightly sand to uniform colour/appearance\n•	Add caulk to frame and wall gaps\n•	Replace cracking/dry or missing putty. Use Putty Hardener\n•	Apply 1 coat of Indoor/Outdoor Varnish and let dry\n•	Lightly sand and apply second coat of Indoor/Outdoor Varnish"},
-    {"Item": "Varnish Wood- Windows/Doors", "Unit": "each", "Material (R/unit)": 175, "Labour (R/unit)": 275,
-     "Default Job Notes": "•	Lightly sand to uniform colour/appearance\n•	Add caulk to frame and wall gaps\n•	Replace cracking/dry or missing putty. Use Putty Hardener\n•	Apply 1 coat of Indoor/Outdoor Varnish and let dry\n•	Lightly sand and apply second coat of Indoor/Outdoor Varnish"},
-    {"Item": "Waterproofing Rising Damp/ Horizontals", "Unit": "m²", "Material (R/unit)": 55, "Labour (R/unit)": 36,
-     "Default Job Notes": "•	Remove all loose contaminants.\n•	Apply 1 coat of Waterpoof Slurry Kit from the floor to +-/ 30cm above the affected area.\n•	Wait 1 to 2 hours and apply second coat of Waterproof Slurry Kit to same area.\n•	Continue with priming and painting."},
-    {"Item": "Waterproofing Roofs/Concrete Deks", "Unit": "m²", "Material (R/unit)": 105, "Labour (R/unit)": 55,
-     "Default Job Notes": "•	Remove all loose contaminants and materials.\n•	Apply flashmesh and coat with PCT36 to corners.\n•	Apply two coats of PCT36 Slurry. Ligtly wet concrete before application.\n•	Continue with priming and painting. PCT must be overcoated with UV resistant coating."},
-    {"Item": "Wood Floors – Sanded to Renew & Varnish", "Unit": "m²", "Material (R/unit)": 105, "Labour (R/unit)": 65,
-     "Default Job Notes": "• Note to Client: This is a dusty process. The complete floor must be done in one stage. The floor must be clear of furniture.\n• Vacuum the floor to remove dust.\n• Apply the first coat of indoor varnish thinned with 10% thinners to penetrate the wood.\n• Sand the first coat with 300-grit sandpaper in circular movements and wipe clean.\n• Apply the final coat. Second painter to lay off the wet varnish to prevent lines -maintaining a wet edge."},
-    {"Item": "Wood Floors/Rails/ Decks Varnish", "Unit": "m²", "Material (R/unit)": 45, "Labour (R/unit)": 55,
-     "Default Job Notes": "• Lightly sand wood to remove loose material and key in the new coat.\n• Apply 2 coats Indoor Varnish for woodwork."},
-    {"Item": "Wood Repair", "Unit": "lm", "Material (R/unit)": 50, "Labour (R/unit)": 50,
-     "Default Job Notes": "•	Remove damaged coating, loose materials or rotten wood.\n•	Sand down reamining wood to uniform matt finish\n•	Prime all replacement pieces of wood with Wood Primer\n•	Spot prime nails, hinges and fittings with Metal Etch Primer\n•	Treat knots or resin marks with Knotting and Wood sealer\n•	Allow to dry and lightly sand to create a good surface for priming"},
-]
-
+DEFAULT_MASTER_RATES =     [
+        {
+            "Item": "High Pressure Washing",
+            "Unit": "each",
+            "Material (R/unit)": 980.0,
+            "Labour (R/unit)": 700.0,
+            "Default Job Notes": "NOTE TO CLIENT: This is a noisy process and can be messy. This should not take more than the indicted days and will be cleaned up. Please point out water sources to be used to the Team Leader upon commencment of work.\n•\tHigh pressure wash min pressure 200 bar  \n•\tWash to remove all salt and dirt + Loose material from area. \n•\tWhen working on the roof use safety harness and anchor point for safety. \n•\tUse drop sheet and garbage bags to collect all loose material generated. \n•\tPerform cleanup of the area before commencing to with next step"
+        },
+        {
+            "Item": "Roof Wash",
+            "Unit": "m²",
+            "Material (R/unit)": 12.0,
+            "Labour (R/unit)": 60.0,
+            "Default Job Notes": "NOTE TO CLIENT: This is a noisy process and can be messy. This should not take more than the indicted days and will be cleaned up. Please point out water sources to be used to the Team Leader upon commencment of work.\n•\tHigh pressure wash min pressure 200 bar  \n•\tApply 1 coat Midas FUNGICIDAL WASH to all affected areas.\n•\tAllow minimum 24 hours reaction time.\n•\tRemove all growth with a stiff fibre brush.\n•\tApply SECOND coat of FUNGICIDAL WASH.\n•\tDO NOT rinse off the second coat.\n•\tFailure to follow this sequence risks regrowth. \n•\tWhen working on the roof use safety harness and anchor point for safety. \n•\tUse drop sheet and garbage bags to collect all loose material generated. \n•\tPerform cleanup of the area before commencing to with next step"
+        },
+        {
+            "Item": "Plaster Repair",
+            "Unit": "m²",
+            "Material (R/unit)": 80.0,
+            "Labour (R/unit)": 50.0,
+            "Default Job Notes": "•\tRemove ALL loose, defective and damaged plaster\n•\tPrime area with 1 coat bonding liquid\n•\tRepair with Paintsmiths PLASTER REPAIR KIT\n•\tDo not exceed 20mm thickness.\n•\tDo not rush curing – insufficient curing leads to failure\n•\tWet plaster 2 times daily or cover with dropsheet after first wetting.\n•\tSmoothen plaster or use a sponge to match existing texture."
+        },
+        {
+            "Item": "Crack Repairs",
+            "Unit": "m²",
+            "Material (R/unit)": 115.0,
+            "Labour (R/unit)": 70.0,
+            "Default Job Notes": "•\tRake out all cracks wider than 0.5mm (not hairline cracks)\n•\tPrime with waterproofing slurry kit OR PCT36\n•\tBuild up cracks with REPAIR MIX\n•\tSmoothen or use a sponge to match existing texture\n•\tOpen all expansion joints and seal with All Round Sealer"
+        },
+        {
+            "Item": "Wood Repair",
+            "Unit": "lm",
+            "Material (R/unit)": 50.0,
+            "Labour (R/unit)": 50.0,
+            "Default Job Notes": "•\tRemove damaged coating, loose materials or rotten wood.\n•\tSand down reamining wood to uniform matt finish\n•\tPrime all replacement pieces of wood with Wood Primer\n•\tSpot prime nails, hinges and fittings with Metal Etch Primer\n•\tTreat knots or resin marks with Knotting and Wood sealer\n•\tAllow to dry and lightly sand to create a good surface for priming"
+        },
+        {
+            "Item": "Aluminium Restore",
+            "Unit": "each",
+            "Material (R/unit)": 11.0,
+            "Labour (R/unit)": 35.0,
+            "Default Job Notes": "•\tRemove all loose contaminents with a soft bristle brush\n•\tSpray Aluminium Cleaner, let soak for 5 to 10min and wipe off\n•\tApply Alu Revivie to a soft fibre cloth and apply in circular motion till dry\n•\tAdd coates of Alu revive till desired finish is achieved"
+        },
+        {
+            "Item": "Mould and Fungi Treatment",
+            "Unit": "m²",
+            "Material (R/unit)": 12.0,
+            "Labour (R/unit)": 35.0,
+            "Default Job Notes": "•\tApply 1 coat Midas FUNGICIDAL WASH to all affected areas.\n•\tAllow minimum 24 hours reaction time.\n•\tRemove all growth with a stiff fibre brush.\n•\tApply SECOND coat of FUNGICIDAL WASH.\n•\tDO NOT rinse off the second coat.\n•\tFailure to follow this sequence risks regrowth."
+        },
+        {
+            "Item": "Skimming",
+            "Unit": "m²",
+            "Material (R/unit)": 45.0,
+            "Labour (R/unit)": 90.0,
+            "Default Job Notes": "•\tComplete repairs first\n•\tAllow fillers and repairs to dry\n•\tUse a steel trowel and Exterior OR Interior Skimfill to achieve smooth uniform surface\n•\tSand lightly and wipe down before continuing to prime and paint"
+        },
+        {
+            "Item": "Facias/Gutters",
+            "Unit": "lm",
+            "Material (R/unit)": 30.0,
+            "Labour (R/unit)": 40.0,
+            "Default Job Notes": "•\tEnsure surfaces are clean inside and out.\n•\tSeal leaks and joints using All Round Sealer, use Peel and Seel for larger gaps\n•\tApply 1 coat of Universal Primer\n•\tApply 2 coats of Midalux 240 (colour to be secified)"
+        },
+        {
+            "Item": "Exterior Walls Paintwork",
+            "Unit": "m²",
+            "Material (R/unit)": 60.0,
+            "Labour (R/unit)": 35.0,
+            "Default Job Notes": "•\tPreperation work quoted separately\n•\tRemove all loose contaminents and let dry after Pressure Wash.\n•\tAllow any repair work to fully dry\n•\tSand lightly and remove dust\n•\tSpot prime repairs with Masonry Primer. On new build Prime entire wall with Masonry Primer\n•\tApply 2 coats of Midalux 240 (colour to be specified)"
+        },
+        {
+            "Item": "Exterior Walls- Textured Intermediate",
+            "Unit": "m²",
+            "Material (R/unit)": 78.0,
+            "Labour (R/unit)": 35.0,
+            "Default Job Notes": "•\tPreperation work quoted separately\n•\tRemove all loose contaminents and let dry after Pressure Wash.\n•\tAllow any repair work to fully dry\n•\tSand lightly and remove dust\n•\tSpot prime repairs with Masonry Primer. On new build Prime entire wall with Masonry Primer\n•\tApply 1 coat of Midamite Fine/Medium/Coarse to suit existing texture (colour to be specified)\n•\tApply 2 coats of Midalux 240 (colour to be specified)"
+        },
+        {
+            "Item": "Roof Painting",
+            "Unit": "m²",
+            "Material (R/unit)": 80.0,
+            "Labour (R/unit)": 65.0,
+            "Default Job Notes": "•\tEnsure roof is dry and clean. Do not paint in high humidity, temperature or probability of mist/rain.\n•\tSpot prime nails, roof screws and metal fittings with Rust Neutrelizer and Metal Etch Primer.\n•\tIf needed apply 1 coat of Primer\n•\tApply 2 coats of Midas Masteroof OR Rubberduck (colour to be specified)"
+        },
+        {
+            "Item": "Windows/Doors- Paint Metal",
+            "Unit": "each",
+            "Material (R/unit)": 185.0,
+            "Labour (R/unit)": 275.0,
+            "Default Job Notes": "•\tClean metal with Midas Degreaser\n•\tLighlty sand metal to dull uniform surface\n•\tAdd caulk to frame and wall gaps\n•\tApply 1 coat Metaletch Primer\n•\tApply 1 coat Midaflow Gloss or Midas Masterroof (colour to be specified)"
+        },
+        {
+            "Item": "Windows/ Doors- Paint Wood",
+            "Unit": "each",
+            "Material (R/unit)": 150.0,
+            "Labour (R/unit)": 225.0,
+            "Default Job Notes": "•\tIf bare/ new wood present, apply Midas Woodprime to all new surfaces\n•\tLightly sand to uniform colour/appearance\n•\tAdd caulk to frame and wall gaps\n•\tReplace cracking/dry or missing putty. Use Putty Hardener\n•\tSpot prime nails, screws or metal fittings with Metal Etch Primer\n•\tApply 1 coat of Universal Undercoat\n•\tApply 2 coat of Midalux 240 OR 2 coats of Midaflow (ext) WB Non-Drip (int) (colour to be specified)"
+        },
+        {
+            "Item": "Windows/Doors- Timber Preserve",
+            "Unit": "each",
+            "Material (R/unit)": 125.0,
+            "Labour (R/unit)": 175.0,
+            "Default Job Notes": "•\tLightly sand to uniform colour/appearance\n•\tAdd caulk to frame and wall gaps\n•\tReplace cracking/dry or missing putty. Use Putty Hardener\n•\tApply 1 coat of Timber Preserve**\n•\tLighlty sand and apply second coat of Timber Preserve**\n**Please note drying time is 48hrs +"
+        },
+        {
+            "Item": "Windows/Doors- Varnish Wood",
+            "Unit": "each",
+            "Material (R/unit)": 175.0,
+            "Labour (R/unit)": 275.0,
+            "Default Job Notes": "•\tLightly sand to uniform colour/appearance\n•\tAdd caulk to frame and wall gaps\n•\tReplace cracking/dry or missing putty. Use Putty Hardener\n•\tApply 1 coat of Indoor/Outdoor Varnish and let dry\n•\tLightly sand and apply second coat of Indoor/Outdoor Varnish"
+        },
+        {
+            "Item": "Paint Wood",
+            "Unit": "m²",
+            "Material (R/unit)": 60.0,
+            "Labour (R/unit)": 45.0,
+            "Default Job Notes": "•\tIf bare/ new wood present, apply Midas Woodprime to all new surfaces\n•\tLightly sand to uniform colour/appearance\n•\tAdd caulk to frame and wall gaps\n•\tReplace cracking/dry or missing putty. Use Putty Hardener\n•\tSpot prime nails, screws or metal fittings with Metal Etch Primer\n•\tApply 1 coat of Universal Undercoat\n•\tApply 2 coat of Midalux 240 OR 2 coats of Water Based Non-Drip Enamel (colour to be specified)"
+        },
+        {
+            "Item": "Varnish Wood",
+            "Unit": "m²",
+            "Material (R/unit)": 51.0,
+            "Labour (R/unit)": 55.0,
+            "Default Job Notes": "•\tLightly sand to uniform colour/appearance\n•\tAdd caulk to frame and wall gaps\n•\tReplace cracking/dry or missing putty. Use Putty Hardener\n•\tApply 1 coat of Indoor/Outdoor Varnish and let dry\n•\tLightly sand and apply second coat of Indoor/Outdoor Varnish"
+        },
+        {
+            "Item": "Timber Preserve",
+            "Unit": "m²",
+            "Material (R/unit)": 70.0,
+            "Labour (R/unit)": 45.0,
+            "Default Job Notes": "•\tLightly sand to uniform colour/appearance\n•\tAdd caulk to frame and wall gaps\n•\tReplace cracking/dry or missing putty. Use Putty Hardener\n•\tApply 1 coat of Timber Preserve**\n•\tLighlty sand and apply second coat of Timber Preserve**\n**Please note drying time is 48hrs +"
+        },
+        {
+            "Item": "Paint Galvanised Metal",
+            "Unit": "m²",
+            "Material (R/unit)": 125.0,
+            "Labour (R/unit)": 45.0,
+            "Default Job Notes": "•\tLightly sand surface to dull uniform appearance\n•\tApply 1 coat of 504 Surface Tolerant Epoxy as Primer\n•\tAllow 6 to 12 hours (weather depending) to dry before overcoating\n•\tApply 1 coat of 504 Surface Tolerant Epoxy\n•\tAllow to Allow 6 to 12 hours (weather depending) to dry before overcoating\n•\tApply 2 coats of 112 Solvent Based Acrithane Sealer"
+        },
+        {
+            "Item": "Paint Metal",
+            "Unit": "m²",
+            "Material (R/unit)": 75.0,
+            "Labour (R/unit)": 55.0,
+            "Default Job Notes": "•\tClean metal with Midas Degreaser\n•\tLighlty sand metal to dull uniform surface\n•\tAdd caulk to frame and wall gaps\n•\tApply 1 coat Metaletch Primer\n•\tApply 1 coat Midaflow Gloss or Midas Masterroof (colour to be specified)"
+        },
+        {
+            "Item": "Interior Walls Paintwork",
+            "Unit": "m²",
+            "Material (R/unit)": 55.0,
+            "Labour (R/unit)": 35.0,
+            "Default Job Notes": "•\tIf not skimmed/repaired wash walls with Sugar Soap where contaminated\n•\tLet repairs/wash completely dry\n•\tSand repairs and spot prime with Plaster Primer. On new builds prime entire wall with Plaster Primer\n•\tApply two coats of Midafelt 230 (Colour to be specified)"
+        },
+        {
+            "Item": "Interior Walls- Textured Intermediate",
+            "Unit": "m²",
+            "Material (R/unit)": 72.0,
+            "Labour (R/unit)": 35.0,
+            "Default Job Notes": "•\tIf not skimmed/repaired wash walls with Sugar Soap where contaminated\n•\tLet repairs/wash completely dry\n•\tSand repairs and spot prime with Plaster Primer\n•\tApply 1 coat of Midamite Fine/Medium/Coarse to suite existing texture (colour to be specified)\n•\tApply two coats of Midafelt 230 (Colour to be specified)"
+        },
+        {
+            "Item": "Ceiling/Soffits",
+            "Unit": "m²",
+            "Material (R/unit)": 47.0,
+            "Labour (R/unit)": 55.0,
+            "Default Job Notes": "•\tWash ceilings where necessary.\n•\tRemove all dust, cobwebs or loose contamination with soft bristle brush.\n•\tCaulk ceilings to cornice or wall.\n•\tFor skimmed ceilings, prime with Midas Plaster Primer.\n•\tApply 2coats of Midafelt 225 (colour to be specified)"
+        },
+        {
+            "Item": "Skirtings",
+            "Unit": "lm",
+            "Material (R/unit)": 45.0,
+            "Labour (R/unit)": 35.0,
+            "Default Job Notes": "•\tRemove loose contaminents and wash with Midas Degreaser where neccesary\n•\tAllow to fully dry, then sand lightly to remove gloss and get a uniform finish.\n•\tCaulk skirting where neccesary\n•\tApply 1 coat of Universal Undercoat\n•\tAllow 4 hours for overcoating\n•\tApply 2 coats of Midafelt 225 OR 2 coats of Waterbased Non-drip Enamel (colour to be specified)"
+        },
+        {
+            "Item": "Cornices",
+            "Unit": "lm",
+            "Material (R/unit)": 35.0,
+            "Labour (R/unit)": 35.0,
+            "Default Job Notes": "•\tRemove loose contaminents and wash with Midas Degreaser where neccesary\n•\tAllow to fully dry, then sand lightly to remove gloss and get a uniform finish.\n•\tCaulk cornice where neccesary\n•\tApply 1 coat of Universal Undercoat\n•\tAllow 4 hours for overcoating\n•\tApply 2 coats of Midafelt 225 OR 2 coats of Waterbased Non-drip Enamel (colour to be specified)"
+        },
+        {
+            "Item": "Waterproofing Rising Damp/ Horizontals",
+            "Unit": "m²",
+            "Material (R/unit)": 140.0,
+            "Labour (R/unit)": 80.0,
+            "Default Job Notes": "•\tRemove all loose contaminants.\n•\tApply 1 coat of Waterpoof Slurry Kit from the floor to +-/ 30cm above the affected area.\n•\tWait 1 to 2 hours and apply second coat of Waterproof Slurry Kit to same area.\n•\tContinue with priming and painting."
+        },
+        {
+            "Item": "Waterproofing Roofs/Concrete Deks",
+            "Unit": "m²",
+            "Material (R/unit)": 135.0,
+            "Labour (R/unit)": 80.0,
+            "Default Job Notes": "•\tRemove all loose contaminants and materials.\n•\tApply flashmesh and coat with PCT36 to corners.\n•\tApply two coats of PCT36 Slurry. Ligtly wet concrete before application.\n•\tContinue with priming and painting. PCT must be overcoated with UV resistant coating."
+        },
+        {
+            "Item": "Wood Floors - Sanded to Renew & Varnish",
+            "Unit": "m²",
+            "Material (R/unit)": 105.0,
+            "Labour (R/unit)": 65.0,
+            "Default Job Notes": "• Note to Client: This is a dusty process. The complete floor must be done in one stage. The floor must be clear of furniture.\n• Vacuum the floor to remove dust.\n• Apply the first coat of indoor varnish thinned with 10% thinners to penetrate the wood.\n• Sand the first coat with 300-grit sandpaper in circular movements and wipe clean.\n• Apply the final coat. Second painter to lay off the wet varnish to prevent lines -maintaining a wet edge."
+        },
+        {
+            "Item": "Wood Floors- Rails/ Decks Varnish",
+            "Unit": "m²",
+            "Material (R/unit)": 45.0,
+            "Labour (R/unit)": 55.0,
+            "Default Job Notes": "• Lightly sand wood to remove loose material and key in the new coat.\n• Apply 2 coats Indoor Varnish for woodwork."
+        },
+        {
+            "Item": "Floors- Tile Remove",
+            "Unit": "each",
+            "Material (R/unit)": 750.0,
+            "Labour (R/unit)": 350.0,
+            "Default Job Notes": "•\tNote to Client: Work following tile removal is a provisional part of the quote- Dependant on substrate condition the quote will have to be reassessed.\n•\tLarger cracks, imperfections or soft/powdery tops, may influence the cost of Materials. Provision is made is this quote for smaller cracks and imperfections.\n•\tThis does not include skip rental, quoted under additionals\n•\tRemove tiles\n•\tRake out all cracks and vaccuum to remove loose contamination\n•\tUse anchoring and patching cement to fill all cracks\n•\tGrind open expansion joints in concrete slab and seal with Skifa FC11"
+        },
+        {
+            "Item": "Floors- Cup Grind (Prep)",
+            "Unit": "m²",
+            "Material (R/unit)": 30.0,
+            "Labour (R/unit)": 45.0,
+            "Default Job Notes": "Note to Client: Cup grinding is a noisy and dusty process. We recommend to remove all items from the room. We aim to complete the work in the prescribed time.\n•\tThrouogly sweep floor to remove loose conatminents.\n•\tVaccuum floor to remove all dust and finer contaminents.\n•\tPass the cup-grinder once over the area to achieve a level uniform top.\n•\tThe objective is to remove the top layer of concrete to create a key coat for the following steps."
+        },
+        {
+            "Item": "Floors- Cup Grind (Final)",
+            "Unit": "m²",
+            "Material (R/unit)": 75.0,
+            "Labour (R/unit)": 90.0,
+            "Default Job Notes": "Note to Client: Cup grinding is a noisy and dusty process. We recommend to remove all items from the room. We aim to complete the work in the prescribed time.\n•\tThrouogly sweep floor to remove loose conatminents.\n•\tVaccuum floor to remove all dust and finer contaminents.\n•\tPass the cup-grinder once over the area to remove high spots\n•\tSweep and vacuum floor to remove all dust\n•\tUsing a straight edge, look for high spots and mark with chalk\n•\tPass over with the cup-grinder for a second time to cut a smooth uniform finish. \n•\tThe objective is to grind down the top to a smooth, flat surface, which can be cleaned and sealed."
+        },
+        {
+            "Item": "Floors- Pigmented Floor Cote",
+            "Unit": "m²",
+            "Material (R/unit)": 750.0,
+            "Labour (R/unit)": 150.0,
+            "Default Job Notes": "PREREQUISITES: All building work complete. Concrete min 25 MPa, moisture ≤ 10%. Minimum ambient temp: 15°C.\n•\tApply 1 coat Floor Screed Primer at ±8 m²/L. Allow 4 hours to dry.\n•\tMix full 25 kg of Pigmented Floor Cote bag at once (liquid first, then powder) to a thick, lump-free paste. Must be applied in one continuous session – do not stop mid-section.\n•\tTrowel onto floor at ±3mm thick (4–5 m² per bag). Work towards yourself. Leave slight ridges or use sponge trowel for colour variation.\n•\tAllow 60–90 min to set. Lightly wet with block brush + plastic float (circular motion). \n•\tFinish with light steel trowel. Remove excess slurry immediately.\n•\tAllow 24–48 hours, sand with 200 grit; vacuum. \n•\tApply 1–2 coats Colour Retaining Primer (10 m²/L, 4–6 hrs between).\n•\tAllow to dry overnight\n•\tApply 2–3 coats Acrithane sealer"
+        },
+        {
+            "Item": "Floors- 504 Surface Tolerant Epoxy",
+            "Unit": "m²",
+            "Material (R/unit)": 150.0,
+            "Labour (R/unit)": 60.0,
+            "Default Job Notes": "•\tRemove salt contamination with fresh water and Holdtight® 102\n•\tSand and vacuum the floor thoroughly\n•\tMoisture content must be below 15%\n•\tSound old coatings may be left in place\n•\tRemove all filters from spray equipment\n•\tMix 504 Epoxy to 4:1, where 4 parts A and 1 part B.\n•\tApply first coat of 504\n•\tAllow to dry overnight\n•\tApply second Coat of 504 Epoxy\n•\tAllow 24 hours for final coat to cure before light use\n•\tAllow 7 days curing before full use- Do not put down any furnuture on the floor before this time, it will leave marks as Epoxy cures under the weight."
+        },
+        {
+            "Item": "Floors- FC Marble (Cement Application)",
+            "Unit": "m²",
+            "Material (R/unit)": 306.0,
+            "Labour (R/unit)": 90.0,
+            "Default Job Notes": "•\tApply 1 coat Floor Coat Screed Primer (D135) at ±8 m²/L\n•\tApply 2 coats Tread FC Marble at max 1mm thickness per coat over 20–25 m² per 8 kg kit\n•\tAllow 4 hours between coats. Sand between coats and vacuum\n•\tApply second coat in same manner. Sand and vacuum final coat before sealing.\n•\tApply 1 coat Colour Retaining Primer at ±10 m²/L. Allow 4–6 hrs drying.\n•\tApply 2 coats Acrithane sealer at ±10 m²/L per coat. Allow 8 hrs between coats. Full cure: 7 days (light traffic after 3 days)."
+        },
+        {
+            "Item": "Floors- FC Marble (Tile Application)",
+            "Unit": "m²",
+            "Material (R/unit)": 465.0,
+            "Labour (R/unit)": 180.0,
+            "Default Job Notes": "•\tApply D204 Epoxy Putty on all grout lines of tiles.\n•\tCup grind tiles to remove the glaze to allow mechanical adhesion\n•\tApply 1 coat of 504 Epoxy\n•\tWhile Epoxy cures (2 to 3 hours after application) apply 1 layer of GR.1 sand\n•\tAllow to cure overnight, sweep all loose sand\n•\tApply 1 coat of Floor Screed Primer (D135) at ±8 m²/L\n•\tApply Self-Levelling Screed primer to smooth floor\n•\tSand to remove top laitance, vacuum thorougly\n•\tApply 1 coat of Floor Screed Primer (D135) at ±8 m²/L\n•\tClose all windows and doors to prevent contamination\n•\tSweep and vacuum floors\n•\tApply 2 coats Tread FC Marble at max 1mm thickness per coat over 20–25 m² per 8 kg kit\n•\tAllow 4 hours between coats. Sand between coats and vacuum\n•\tApply second coat in same manner. Sand and vacuum final coat before sealing.\n•\tApply 1 coat Colour Retaining Primer at ±10 m²/L. Allow 4–6 hrs drying.\n•\tApply 2 coats Acrithane sealer at ±10 m²/L per coat. Allow 8 hrs between coats. Full cure: 7 days (light traffic after 3 days)."
+        }
+    ]
 
 _ADDITIONAL_RATE_UNIT_OPTIONS = ["per day", "per km", "per 1000 liters", "per litre"]
 _ADDITIONAL_RATE_UNIT_TO_KEY = {
